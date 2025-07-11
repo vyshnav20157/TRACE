@@ -1,4 +1,4 @@
-# Modular CLIP Fine-Tuning
+# CAMU: Context Augmentation for Meme Understanding
 
 A modular implementation for fine-tuning CLIP models for multimodal classification tasks, specifically for the Hateful Memes dataset with extended captions. This repository includes scripts for fine-tuning both `CLIP-ViT-L/14` and `CLIP-XLM-RoBERTa-Large`.
 
