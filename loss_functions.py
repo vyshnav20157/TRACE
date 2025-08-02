@@ -1,12 +1,8 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
-# Import the debug printing function
 from caption_selection import print_caption_selection_debug
 
-# Get tokenizer reference from the global scope if needed
-# This allows the functions to access the tokenizer from the main file
 try:
     from __main__ import hf_tokenizer
 except ImportError:
@@ -99,23 +95,66 @@ def calculate_classification_loss(model, batch, device):
 
 def calculate_contrastive_loss(model, batch, device, temperature=0.07):
     """Calculate contrastive loss between image and text embeddings."""
-    # Handle different batch formats (CLIP vs OpenCLIP)
+    # Handle different batch formats (CLIP vs OpenCLIP vs SigLIP2)
     if 'pixel_values' in batch:
-        # CLIP format
+        # CLIP/SigLIP2 format
         pixel_values = batch['pixel_values'].to(device)
         input_ids = batch['input_ids'].to(device)
         attention_mask = batch['attention_mask'].to(device)
         
         batch_size = pixel_values.size(0)
         
-        # Get image and text features
-        image_embeds = model.clip_model.get_image_features(pixel_values=pixel_values)
-        text_embeds = model.clip_model.get_text_features(
-            input_ids=input_ids[:, 0],  # Use first caption
-            attention_mask=attention_mask[:, 0]
-        )
+        # Get the actual model from DataParallel if needed
+        actual_model = model.module if isinstance(model, nn.DataParallel) else model
+        
+        # Check if it's SigLIP2 or CLIP model
+        if hasattr(actual_model, 'siglip_model'):
+            # SigLIP2 model - use sigmoid loss
+            image_embeds = actual_model.siglip_model.get_image_features(pixel_values=pixel_values)
+            text_embeds = actual_model.siglip_model.get_text_features(
+                input_ids=input_ids[:, 0],  # Use first caption
+                attention_mask=attention_mask[:, 0]
+            )
+            
+            # Normalize features
+            image_embeds = F.normalize(image_embeds, p=2, dim=-1)
+            text_embeds = F.normalize(text_embeds, p=2, dim=-1)
+            
+            # Compute similarity matrix
+            logits = torch.matmul(image_embeds, text_embeds.t()) / temperature
+            
+            # SigLIP uses sigmoid loss instead of softmax
+            # Positive pairs (diagonal) should have high similarity, negative pairs should have low similarity
+            labels = torch.eye(batch_size, device=device)  # Identity matrix for positive pairs
+            
+            # Apply sigmoid and compute binary cross entropy
+            sigmoid_logits = torch.sigmoid(logits)
+            loss = F.binary_cross_entropy(sigmoid_logits, labels, reduction='mean')
+            
+        else:
+            # CLIP model - use traditional contrastive loss
+            image_embeds = actual_model.clip_model.get_image_features(pixel_values=pixel_values)
+            text_embeds = actual_model.clip_model.get_text_features(
+                input_ids=input_ids[:, 0],  # Use first caption
+                attention_mask=attention_mask[:, 0]
+            )
+            
+            # Normalize features
+            image_embeds = F.normalize(image_embeds, p=2, dim=-1)
+            text_embeds = F.normalize(text_embeds, p=2, dim=-1)
+            
+            # Compute similarity matrix
+            logits = torch.matmul(image_embeds, text_embeds.t()) / temperature
+            
+            # Labels for contrastive loss (diagonal is positive pairs)
+            labels = torch.arange(batch_size, device=device)
+            
+            # Compute contrastive loss in both directions
+            loss_i2t = F.cross_entropy(logits, labels)
+            loss_t2i = F.cross_entropy(logits.t(), labels)
+            loss = (loss_i2t + loss_t2i) / 2.0
     else:
-        # OpenCLIP format
+        # OpenCLIP format - always use traditional contrastive loss
         images = batch['image'].to(device)
         texts = batch['text'].to(device)
         
@@ -135,29 +174,29 @@ def calculate_contrastive_loss(model, batch, device, temperature=0.07):
             text_embeds = actual_model.clip_model.encode_text(texts)
         
         image_embeds = actual_model.clip_model.encode_image(images)
-    
-    # Normalize features
-    image_embeds = F.normalize(image_embeds, p=2, dim=-1)
-    text_embeds = F.normalize(text_embeds, p=2, dim=-1)
-    
-    # Compute similarity matrix
-    logits = torch.matmul(image_embeds, text_embeds.t()) / temperature
-    
-    # Labels for contrastive loss (diagonal is positive pairs)
-    labels = torch.arange(batch_size, device=device)
-    
-    # Compute contrastive loss in both directions
-    loss_i2t = F.cross_entropy(logits, labels)
-    loss_t2i = F.cross_entropy(logits.t(), labels)
-    loss = (loss_i2t + loss_t2i) / 2.0
+        
+        # Normalize features
+        image_embeds = F.normalize(image_embeds, p=2, dim=-1)
+        text_embeds = F.normalize(text_embeds, p=2, dim=-1)
+        
+        # Compute similarity matrix
+        logits = torch.matmul(image_embeds, text_embeds.t()) / temperature
+        
+        # Labels for contrastive loss (diagonal is positive pairs)
+        labels = torch.arange(batch_size, device=device)
+        
+        # Compute contrastive loss in both directions
+        loss_i2t = F.cross_entropy(logits, labels)
+        loss_t2i = F.cross_entropy(logits.t(), labels)
+        loss = (loss_i2t + loss_t2i) / 2.0
     
     return loss
 
 def calculate_relevance_loss(model, batch, device):
     """Calculate relevance loss using caption scorer."""
-    # Handle different batch formats (CLIP vs OpenCLIP)
+    # Handle different batch formats (CLIP vs OpenCLIP vs SigLIP2)
     if 'pixel_values' in batch:
-        # CLIP format
+        # CLIP/SigLIP2 format
         input_ids = batch['input_ids'].to(device)
         attention_mask = batch['attention_mask'].to(device)
         labels = batch['labels'].to(device)
@@ -180,10 +219,19 @@ def calculate_relevance_loss(model, batch, device):
             if not is_valid_caption.any():
                 continue  # Skip if this caption position is all padding
             
-            text_outputs = actual_model.clip_model.text_model(
-                input_ids=input_ids[:, i],
-                attention_mask=attention_mask[:, i]
-            )
+            # Check if it's SigLIP2 or CLIP model
+            if hasattr(actual_model, 'siglip_model'):
+                # SigLIP2 model
+                text_outputs = actual_model.siglip_model.text_model(
+                    input_ids=input_ids[:, i],
+                    attention_mask=attention_mask[:, i]
+                )
+            else:
+                # CLIP model
+                text_outputs = actual_model.clip_model.text_model(
+                    input_ids=input_ids[:, i],
+                    attention_mask=attention_mask[:, i]
+                )
             text_features = text_outputs.pooler_output
             text_features_list.append(text_features)
         
@@ -248,15 +296,13 @@ def calculate_loss_gs(model, batch, device, loss_config, temp=0.1, hard=True, pr
     use_contrastive = loss_config.get('contrastive', False)
     use_relevance = loss_config.get('relevance', False)
     
-    # Set loss weights based on which losses are active
-    # Classification loss always has weight from the learnable parameter
-    # For contrastive and relevance, we follow the requested weighting scheme
-    contrastive_weight = 0.3 if use_contrastive and use_relevance else 1.0
-    relevance_weight = 0.7 if use_contrastive and use_relevance else 1.0
+    # Clear cache before processing
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
     
-    # Handle different batch formats (CLIP vs OpenCLIP)
+    # Handle different batch formats (CLIP vs OpenCLIP vs SigLIP2)
     if 'pixel_values' in batch:
-        # CLIP format
+        # CLIP/SigLIP2 format
         pixel_values = batch['pixel_values'].to(device)
         input_ids = batch['input_ids'].to(device)
         attention_mask = batch['attention_mask'].to(device)
@@ -265,10 +311,17 @@ def calculate_loss_gs(model, batch, device, loss_config, temp=0.1, hard=True, pr
         # Get model (handle DataParallel)
         actual_model = model.module if isinstance(model, nn.DataParallel) else model
         
-        # Get image features
-        image_outputs = actual_model.clip_model.vision_model(pixel_values=pixel_values)
-        image_embeds = actual_model.clip_model.get_image_features(pixel_values=pixel_values)
-        image_features = image_outputs.pooler_output
+        # Check if it's SigLIP2 or CLIP model and get image features accordingly
+        if hasattr(actual_model, 'siglip_model'):
+            # SigLIP2 model
+            image_outputs = actual_model.siglip_model.vision_model(pixel_values=pixel_values)
+            image_embeds = actual_model.siglip_model.get_image_features(pixel_values=pixel_values)
+            image_features = image_outputs.pooler_output
+        else:
+            # CLIP model
+            image_outputs = actual_model.clip_model.vision_model(pixel_values=pixel_values)
+            image_embeds = actual_model.clip_model.get_image_features(pixel_values=pixel_values)
+            image_features = image_outputs.pooler_output
         
         batch_size = pixel_values.size(0)
         max_captions = input_ids.size(1)
@@ -286,18 +339,29 @@ def calculate_loss_gs(model, batch, device, loss_config, temp=0.1, hard=True, pr
             # Only process if at least one example in the batch has a valid caption
             if is_valid.any():
                 # Get text outputs for classification
-                text_outputs = actual_model.clip_model.text_model(
-                    input_ids=input_ids[:, i],
-                    attention_mask=attention_mask[:, i]
-                )
+                if hasattr(actual_model, 'siglip_model'):
+                    # SigLIP2 model
+                    text_outputs = actual_model.siglip_model.text_model(
+                        input_ids=input_ids[:, i],
+                        attention_mask=attention_mask[:, i]
+                    )
+                    text_embeds = actual_model.siglip_model.get_text_features(
+                        input_ids=input_ids[:, i],
+                        attention_mask=attention_mask[:, i]
+                    )
+                else:
+                    # CLIP model
+                    text_outputs = actual_model.clip_model.text_model(
+                        input_ids=input_ids[:, i],
+                        attention_mask=attention_mask[:, i]
+                    )
+                    text_embeds = actual_model.clip_model.get_text_features(
+                        input_ids=input_ids[:, i],
+                        attention_mask=attention_mask[:, i]
+                    )
+                
                 text_features = text_outputs.pooler_output
                 text_features_list.append(text_features)
-                
-                # Get text embeddings for contrastive learning
-                text_embeds = actual_model.clip_model.get_text_features(
-                    input_ids=input_ids[:, i],
-                    attention_mask=attention_mask[:, i]
-                )
                 text_embeds_list.append(text_embeds)
         
         # Handle case where we might have fewer than max_captions valid caption positions
@@ -365,8 +429,13 @@ def calculate_loss_gs(model, batch, device, loss_config, temp=0.1, hard=True, pr
                 if not is_valid.any():
                     continue
             
-            # Get text features for this caption position
-            text_feats = actual_model.clip_model.encode_text(texts[:, i])
+            # Clear cache before each text encoding
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            
+            # Get text features for this caption position with memory optimization
+            with torch.amp.autocast(device_type=device.type, enabled=False):  # Disable autocast for text encoding
+                text_feats = actual_model.clip_model.encode_text(texts[:, i])
             text_features_list.append(text_feats)
             text_embeds_list.append(text_feats)  # For OpenCLIP, embed and features are the same
             
@@ -382,8 +451,17 @@ def calculate_loss_gs(model, batch, device, loss_config, temp=0.1, hard=True, pr
         
         # Score captions
         if use_relevance:
-            caption_scores = actual_model.caption_scorer(text_features.view(-1, text_features.size(-1))).squeeze()
-            caption_scores = caption_scores.view(batch_size, valid_captions)
+            # Process caption scoring in smaller chunks
+            caption_scores_list = []
+            chunk_size = min(batch_size, 32)  # Process in smaller chunks
+            for i in range(0, batch_size, chunk_size):
+                end_idx = min(i + chunk_size, batch_size)
+                chunk_features = text_features[i:end_idx].view(-1, text_features.size(-1))
+                chunk_scores = actual_model.caption_scorer(chunk_features).squeeze()
+                chunk_scores = chunk_scores.view(end_idx - i, valid_captions)
+                caption_scores_list.append(chunk_scores)
+            
+            caption_scores = torch.cat(caption_scores_list, dim=0)
             caption_scores = caption_scores * valid_mask[:, :valid_captions]
         else:
             # Use cosine similarity for caption selection
@@ -422,6 +500,11 @@ def calculate_loss_gs(model, batch, device, loss_config, temp=0.1, hard=True, pr
         selected_mask.unsqueeze(1), 
         text_embeds
     ).squeeze(1)
+    
+    # Clear intermediate tensors to save memory
+    del text_features_list, text_embeds_list
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
     
     # Debug printing with improved caption selection details
     if is_training and hasattr(calculate_loss_gs, 'call_count'):
@@ -499,56 +582,85 @@ def calculate_loss_gs(model, batch, device, loss_config, temp=0.1, hard=True, pr
         cls_loss = criterion(logits, labels)
         
         # Add to total loss - keep using the learnable weight for classification
-        cls_weight = torch.exp(-actual_model.log_vars[0])
-        total_loss += cls_weight * cls_loss + 0.5 * actual_model.log_vars[0]
+        precision_cls = torch.exp(-actual_model.log_vars[0])
+        total_loss += precision_cls * cls_loss + 0.5 * actual_model.log_vars[0]
     
     # Calculate contrastive loss if enabled
     if use_contrastive and is_training:
-        # Normalize embeddings
-        image_embeds_norm = F.normalize(image_embeds, p=2, dim=-1)
-        text_embeds_norm = F.normalize(selected_text_embeds, p=2, dim=-1)
+        # Check if it's SigLIP2 or CLIP model for different loss calculations
+        if hasattr(actual_model, 'siglip_model'):
+            # SigLIP2 model - use sigmoid loss
+            # Normalize embeddings
+            image_embeds_norm = F.normalize(image_embeds, p=2, dim=-1)
+            text_embeds_norm = F.normalize(selected_text_embeds, p=2, dim=-1)
+            
+            # Compute similarity matrix
+            similarity = torch.matmul(image_embeds_norm, text_embeds_norm.t()) / temperature
+            
+            # SigLIP uses sigmoid loss - positive pairs should have high similarity
+            labels = torch.eye(batch_size, device=device)  # Identity matrix for positive pairs
+            # Use binary_cross_entropy_with_logits instead of applying sigmoid + binary_cross_entropy
+            contrastive_loss = F.binary_cross_entropy_with_logits(similarity, labels, reduction='mean')
+        else:
+            # CLIP model - use traditional contrastive loss
+            # Normalize embeddings
+            image_embeds_norm = F.normalize(image_embeds, p=2, dim=-1)
+            text_embeds_norm = F.normalize(selected_text_embeds, p=2, dim=-1)
+            
+            # Compute similarity matrix
+            similarity = torch.matmul(image_embeds_norm, text_embeds_norm.t()) / temperature
+            contrastive_labels = torch.arange(batch_size, device=device)
+            
+            # Compute contrastive loss in both directions
+            loss_i2t = F.cross_entropy(similarity, contrastive_labels)
+            loss_t2i = F.cross_entropy(similarity.t(), contrastive_labels)
+            contrastive_loss = (loss_i2t + loss_t2i) / 2.0
         
-        # Compute similarity matrix
-        similarity = torch.matmul(image_embeds_norm, text_embeds_norm.t()) / temperature
-        contrastive_labels = torch.arange(batch_size, device=device)
-        
-        # Compute contrastive loss in both directions
-        loss_i2t = F.cross_entropy(similarity, contrastive_labels)
-        loss_t2i = F.cross_entropy(similarity.t(), contrastive_labels)
-        contrastive_loss = (loss_i2t + loss_t2i) / 2.0
-        
-        # Add to total loss with fixed weight based on configuration
-        # We still multiply by the learnable weight for consistency in logging
-        cont_learnable_weight = torch.exp(-actual_model.log_vars[2])
-        total_loss += contrastive_weight * cont_learnable_weight * contrastive_loss + 0.5 * actual_model.log_vars[2]
+        # Add to total loss using learnable uncertainty weight
+        precision_cont = torch.exp(-actual_model.log_vars[2])
+        total_loss += precision_cont * contrastive_loss + 0.5 * actual_model.log_vars[2]
     
     # Calculate relevance loss if enabled
     if use_relevance and is_training:
         # Apply valid_mask to get mean caption scores
-        caption_score_mean = (caption_scores * valid_mask[:, :valid_captions]).sum(dim=1) / valid_mask.sum(dim=1).clamp(min=1)
+        # Ensure we're only using the valid captions dimension
+        valid_mask_subset = valid_mask[:, :valid_captions]
+        caption_score_mean = (caption_scores * valid_mask_subset).sum(dim=1) / valid_mask_subset.sum(dim=1).clamp(min=1)
         
-        # Relevance loss - ensure labels are on the correct device
-        labels = labels.to(device)  # Explicitly move labels to the device
+        # Relevance loss - ensure labels are on the correct device and have correct shape
+        # Make sure labels is 1D and matches caption_score_mean shape
+        if 'pixel_values' in batch:
+            labels_for_relevance = batch['labels'].to(device).squeeze()  # Ensure 1D
+        else:
+            labels_for_relevance = batch['label'].to(device).squeeze()   # Ensure 1D
+            
+        # Verify shapes match
+        if caption_score_mean.shape != labels_for_relevance.shape:
+            print(f"Warning: Shape mismatch in relevance loss - caption_score_mean: {caption_score_mean.shape}, labels: {labels_for_relevance.shape}")
+            # Take only the batch dimension if labels somehow got duplicated
+            if labels_for_relevance.numel() > caption_score_mean.numel():
+                labels_for_relevance = labels_for_relevance[:caption_score_mean.size(0)]
+        
         criterion = FocalLoss(alpha=0.25, gamma=2.0)
-        relevance_loss = criterion(caption_score_mean, labels.float())
+        relevance_loss = criterion(caption_score_mean, labels_for_relevance.float())
         
-        # Add to total loss with fixed weight based on configuration
-        # We still multiply by the learnable weight for consistency in logging
-        rel_learnable_weight = torch.exp(-actual_model.log_vars[1])
-        total_loss += relevance_weight * rel_learnable_weight * relevance_loss + 0.5 * actual_model.log_vars[1]
+        # Add to total loss using learnable uncertainty weight
+        precision_rel = torch.exp(-actual_model.log_vars[1])
+        total_loss += precision_rel * relevance_loss + 0.5 * actual_model.log_vars[1]
     
     # Print debugging information
     if is_training and hasattr(calculate_loss_gs, 'call_count'):
         if calculate_loss_gs.call_count % print_every == 0:
             print("\n=== Loss Components ===")
             if use_classification:
-                print(f"Classification loss: {cls_loss.item():.4f} (weight: {cls_weight.item():.4f})")
+                cls_weight = torch.exp(-actual_model.log_vars[0])
+                print(f"Classification loss: {cls_loss.item():.4f} (learnable weight: {cls_weight.item():.4f})")
             if use_contrastive:
-                cont_effective_weight = contrastive_weight * cont_learnable_weight.item()
-                print(f"Contrastive loss: {contrastive_loss.item():.4f} (fixed weight: {contrastive_weight:.2f}, learnable weight: {cont_learnable_weight.item():.4f}, effective: {cont_effective_weight:.4f})")
+                cont_learnable_weight = torch.exp(-actual_model.log_vars[2])
+                print(f"Contrastive loss: {contrastive_loss.item():.4f} (learnable weight: {cont_learnable_weight.item():.4f})")
             if use_relevance:
-                rel_effective_weight = relevance_weight * rel_learnable_weight.item()
-                print(f"Relevance loss: {relevance_loss.item():.4f} (fixed weight: {relevance_weight:.2f}, learnable weight: {rel_learnable_weight.item():.4f}, effective: {rel_effective_weight:.4f})")
+                rel_learnable_weight = torch.exp(-actual_model.log_vars[1])
+                print(f"Relevance loss: {relevance_loss.item():.4f} (learnable weight: {rel_learnable_weight.item():.4f})")
             print(f"Total loss: {total_loss.item():.4f}")
     
     if is_training:
