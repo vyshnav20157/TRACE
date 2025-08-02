@@ -23,14 +23,14 @@ from caption_selection import select_best_captions
 from loss_functions import calculate_loss_gs, FocalLoss
 
 # Set seed for reproducibility
-seed = 42
+seed = 121
 random.seed(seed)
 np.random.seed(seed)
 torch.manual_seed(seed)
 if torch.cuda.is_available():
     torch.cuda.manual_seed_all(seed)
 
-device = torch.device("cuda:1" if torch.cuda.is_available() else "cpu")
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # clip_processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch16")
 clip_processor = CLIPProcessor.from_pretrained("openai/clip-vit-large-patch14")
@@ -119,17 +119,19 @@ class CLIPClassifier(nn.Module):
         text_encoder = self.clip_model.text_model
         # image_encoder = self.clip_model.vision_model
 
-        # Unfreeze last 2 transformer encoder layers
+        # Unfreeze last 4 transformer encoder layers
         num_layers = len(text_encoder.encoder.layers)
         print(f"Number of layers: {num_layers}")
-        for layer in text_encoder.encoder.layers[num_layers-1:]:  # Last 2 layers
-            print(f"Layer: {layer}")
+        # Unfreeze only the -2 and -4 layers (counting from the end)
+        for idx in [num_layers - 2, num_layers - 5, num_layers - 8]:
+            layer = text_encoder.encoder.layers[idx]
+            print(f"Unfreezing layer {idx}: {layer}")
             for param in layer.parameters():
                 param.requires_grad = True
 
         # n_layers = len(image_encoder.encoder.layers)
         # print(f"Number of image layers: {n_layers}")
-        # for layer in image_encoder.encoder.layers[n_layers-3:]:  # Last 2 layers
+        # for layer in image_encoder.encoder.layers[n_layers-2:]:  # Last 2 layers
         #     print(f"Layer: {layer}")
         #     for param in layer.parameters():
         #         param.requires_grad = True
@@ -340,8 +342,12 @@ def collate_fn(batch):
 
 def evaluate_model(model, dataloaders, device, loss_config):
     model.eval()
-    all_preds = []
+    all_probs = []
     all_labels = []
+
+    criterion = FocalLoss(gamma=2.0, alpha=0.25, reduction='mean')
+    total_loss = 0
+    total_samples = 0
     
     with torch.no_grad(), torch.amp.autocast(device_type=device.type):
         for dataloader in dataloaders:
@@ -352,9 +358,14 @@ def evaluate_model(model, dataloaders, device, loss_config):
                 # Get logits using calculate_loss_gs in inference mode
                 logits = calculate_loss_gs(model, batch, device, loss_config, is_training=False)
                 labels = batch['labels'].to(device)
+
+                # Calculate Focal Loss
+                loss = criterion(logits, labels)
+                total_loss += loss.item() * len(labels)
+                total_samples += len(labels)
                 
                 preds = torch.sigmoid(logits)
-                all_preds.extend(preds.cpu().numpy())
+                all_probs.extend(preds.cpu().numpy())
                 all_labels.extend(labels.cpu().numpy())
 
                 # Clear memory periodically
@@ -362,25 +373,29 @@ def evaluate_model(model, dataloaders, device, loss_config):
                     torch.cuda.empty_cache()
 
     # Compute metrics
-    precision, recall, thresholds = precision_recall_curve(all_labels, all_preds)
+    precision, recall, thresholds = precision_recall_curve(all_labels, all_probs)
     f1_scores = 2 * precision * recall / (precision + recall + 1e-10)
     threshold = thresholds[np.argmax(f1_scores)]
 
-    preds_binary = (np.array(all_preds) >= threshold).astype(float)
+    # Calculate average loss
+    avg_loss = total_loss / total_samples
+
+    preds_binary = (np.array(all_probs) >= threshold).astype(int)
     accuracy = accuracy_score(all_labels, preds_binary)
     precision = precision_score(all_labels, preds_binary, zero_division=0, average='macro')
     recall = recall_score(all_labels, preds_binary, zero_division=0, average='macro')
     f1 = f1_score(all_labels, preds_binary, zero_division=0, average='macro')
-    auc = roc_auc_score(all_labels, all_preds)
+    auc = roc_auc_score(all_labels, all_probs)
 
     metrics = {
+        'loss': f"{avg_loss:.4f}",
         'accuracy': f"{accuracy:.4f}",
         'precision': f"{precision:.4f}",
         'recall': f"{recall:.4f}",
         'f1': f"{f1:.4f}",
         'auc': f"{auc:.4f}"
     }
-    return metrics
+    return metrics, preds_binary, all_labels
 
 def train_epoch(model, train_dataloader, optimizer, device, accumulation_steps, loss_config, current_temp=1.0):
     model.train()
@@ -439,7 +454,7 @@ def main():
     accumulation_steps = target_batch_size // actual_batch_size
     
     print(f"\nUsing batch size {actual_batch_size} with {accumulation_steps} accumulation steps "
-          f"for effective batch size of {actual_batch_size * accumulation_steps}")
+          f"for effective batch size {actual_batch_size * accumulation_steps}")
 
     wandb.init(
         project="hate-memes-classification",
@@ -477,7 +492,7 @@ def main():
         mode='max',
         factor=0.1,  # Reduce LR by factor of 0.1
         patience=2,   # Wait for 2 epochs without improvement
-        verbose=True, # Print LR changes
+        # verbose=True, # Print LR changes
         min_lr=1e-7  # Minimum LR to prevent it from becoming too small
     )
     
@@ -504,6 +519,7 @@ def main():
     epochs_without_improvement = 0
     best_epoch = start_epoch
     best_val_auc = 0
+    best_val_loss = float('inf')
 
     # Define loss configuration for ablation experiments
     loss_config = {
@@ -515,8 +531,6 @@ def main():
     print(f"\nLoss configuration: {loss_config}")
 
     for epoch in range(start_epoch, start_epoch + num_epochs):
-        # Calculate temperature for Gumbel-Softmax - adjust formula to account for resumed training
-        # This ensures temperature still anneals properly when resuming
         relative_epoch = epoch - start_epoch
         total_epochs = num_epochs
         current_temp = max(1.0 - (relative_epoch / total_epochs) * 0.9, 0.1)  # Annealed from 1.0 to 0.1
@@ -527,9 +541,9 @@ def main():
             torch.cuda.empty_cache()
             
         # Select best captions for both train and val sets
-        print(f"Epoch {epoch+1}: Selecting best captions...")
-        train_best_captions = select_best_captions(zeroshot_model, train_dataset, device, loss_config, batch_size=512)
-        train_dataset.best_captions = train_best_captions
+        # print(f"Epoch {epoch+1}: Selecting best captions...")
+        # train_best_captions = select_best_captions(zeroshot_model, train_dataset, device, loss_config, batch_size=512)
+        # train_dataset.best_captions = train_best_captions
             
         # Training with gradient accumulation and mixed precision
         zeroshot_model.train()
@@ -548,17 +562,18 @@ def main():
             torch.cuda.empty_cache()
         
         # Select best captions for validation
-        print("Selecting best captions for validation...")
-        for val_dataset in val_datasets:
-            val_best_captions = select_best_captions(zeroshot_model, val_dataset, device, loss_config, batch_size=512)
-            val_dataset.best_captions = val_best_captions
+        # print("Selecting best captions for validation...")
+        # for val_dataset in val_datasets:
+        #     val_best_captions = select_best_captions(zeroshot_model, val_dataset, device, loss_config, batch_size=512)
+        #     val_dataset.best_captions = val_best_captions
         
         # Validation
         print("Evaluating on Validation Set...")
-        val_metrics = evaluate_model(
+        val_metrics, _, _ = evaluate_model(
             zeroshot_model.module if isinstance(zeroshot_model, nn.DataParallel) else zeroshot_model, 
             val_dataloaders, device, loss_config
         )
+        print(f"Validation Loss: {val_metrics['loss']}")
         print(f"Validation Metrics: accuracy={val_metrics['accuracy']}, precision={val_metrics['precision']}, "
               f"recall={val_metrics['recall']}, f1={val_metrics['f1']}, auc={val_metrics['auc']}")
         
@@ -607,7 +622,7 @@ def main():
 
     # Evaluate on test set
     print("Evaluating on Test Set...")
-    test_metrics = evaluate_model(zeroshot_model, [test_dataloader], device, loss_config)
+    test_metrics, all_preds, all_labels = evaluate_model(zeroshot_model, [test_dataloader], device, loss_config)
     print(f"Test Metrics: accuracy={test_metrics['accuracy']}, precision={test_metrics['precision']}, "
           f"recall={test_metrics['recall']}, f1={test_metrics['f1']}, auc={test_metrics['auc']}")
 
@@ -619,6 +634,14 @@ def main():
         "Test ROC AUC": round(float(test_metrics['auc']), 4)
     })
 
+    # Save all predictions and labels for test set
+    test_results = {
+        'predictions': [int(pred) for pred in all_preds],
+        'labels': [int(label) for label in all_labels],
+    }
+    with open('clip_vitl14_preds.json', 'w') as f:
+        json.dump(test_results, f, indent=4)
+
     # Evaluate on test unseen set
     print("Evaluating on Test Unseen Set...")
     test_unseen_dataset = MemeDatasetJSON(test_unseen_data, clip_processor)
@@ -628,8 +651,8 @@ def main():
     print("\nSelecting best captions for test unseen set...")
     test_best_captions = select_best_captions(zeroshot_model, test_unseen_dataset, device, loss_config)
     test_unseen_dataset.best_captions = test_best_captions
-    
-    test_unseen_metrics = evaluate_model(zeroshot_model, [test_unseen_dataloader], device, loss_config)
+
+    test_unseen_metrics, _, _ = evaluate_model(zeroshot_model, [test_unseen_dataloader], device, loss_config)
     print(f"Test Unseen Metrics: accuracy={test_unseen_metrics['accuracy']}, precision={test_unseen_metrics['precision']}, "
           f"recall={test_unseen_metrics['recall']}, f1={test_unseen_metrics['f1']}, auc={test_unseen_metrics['auc']}")
 
