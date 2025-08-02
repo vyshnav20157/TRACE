@@ -1,0 +1,10 @@
+__pycache__/
+*.pth
+*.pt
+*.png
+*.txt
+*.json
+*.jsonl
+*.csv
+wandb/
+.vscode/
