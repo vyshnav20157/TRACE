@@ -80,7 +80,7 @@ def collate_fn_open_clip(batch):
     for text in texts:
         num_sequences = text.size(0)
         if num_sequences < max_sequences:
-            # Create padding tensor with same second dimension (77)
+            # Create padding tensor with same second dimension (77 for CLIP, 64 for SigLIP2)
             padding = torch.zeros((max_sequences - num_sequences, text.size(1)), 
                                  dtype=text.dtype, device=text.device)
             padded_text = torch.cat([text, padding], dim=0)
@@ -101,7 +101,7 @@ def collate_fn_open_clip(batch):
         'label': torch.stack([item['label'] for item in batch])
     }
 
-def select_best_captions_by_caption_scorer(model, dataset, device, batch_size=512):
+def select_best_captions_by_caption_scorer(model, dataset, device, batch_size=256):
     """
     Selects the best caption for each image based on caption scorer predictions.
     This is used when relevance loss is present.
@@ -111,17 +111,21 @@ def select_best_captions_by_caption_scorer(model, dataset, device, batch_size=51
     
     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_fn_generic)
     
-    with torch.no_grad(), torch.amp.autocast(device_type=device.type):
+    with torch.no_grad():
         for batch in tqdm(dataloader, desc="Selecting best captions using caption scorer"):
             if batch is None:
                 continue
+            
+            # Clear cache before each batch
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
                 
             # Get model (handle DataParallel)
             actual_model = model.module if isinstance(model, nn.DataParallel) else model
             
             # Handle different batch formats (CLIP vs OpenCLIP)
             if 'pixel_values' in batch:
-                # CLIP format
+                # CLIP/SigLIP2 format
                 pixel_values = batch['pixel_values'].to(device)
                 input_ids = batch['input_ids'].to(device)  # [batch, max_captions, seq_len]
                 attention_mask = batch['attention_mask'].to(device)  # [batch, max_captions, seq_len]
@@ -140,10 +144,19 @@ def select_best_captions_by_caption_scorer(model, dataset, device, batch_size=51
                     if not is_valid_caption.any():
                         continue  # Skip if this caption position is all padding
                     
-                    text_outputs = actual_model.clip_model.text_model(
-                        input_ids=input_ids[:, i],
-                        attention_mask=attention_mask[:, i]
-                    )
+                    # Check if it's SigLIP2 or CLIP model
+                    if hasattr(actual_model, 'siglip_model'):
+                        # SigLIP2 model
+                        text_outputs = actual_model.siglip_model.text_model(
+                            input_ids=input_ids[:, i],
+                            attention_mask=attention_mask[:, i]
+                        )
+                    else:
+                        # CLIP model
+                        text_outputs = actual_model.clip_model.text_model(
+                            input_ids=input_ids[:, i],
+                            attention_mask=attention_mask[:, i]
+                        )
                     text_features = text_outputs.pooler_output
                     text_features_list.append(text_features)
             else:
@@ -165,8 +178,14 @@ def select_best_captions_by_caption_scorer(model, dataset, device, batch_size=51
                         if not is_valid.any():
                             continue
                     
-                    text_features = actual_model.clip_model.encode_text(texts[:, i])
+                    # Use autocast for memory efficiency
+                    with torch.amp.autocast(device_type=device.type, enabled=False):
+                        text_features = actual_model.clip_model.encode_text(texts[:, i])
                     text_features_list.append(text_features)
+                    
+                    # Clear cache after each caption
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
             
             if not text_features_list:  # In case all captions were padding
                 continue
@@ -174,9 +193,18 @@ def select_best_captions_by_caption_scorer(model, dataset, device, batch_size=51
             text_features = torch.stack(text_features_list, dim=1)  # [batch, valid_captions, dim]
             valid_captions = text_features.size(1)
             
-            # Score captions using caption scorer
-            caption_scores = actual_model.caption_scorer(text_features.view(-1, text_features.size(-1))).squeeze()
-            caption_scores = torch.sigmoid(caption_scores).view(batch_size, valid_captions)
+            # Score captions using caption scorer with chunking
+            chunk_size = min(batch_size, 16)  # Process in smaller chunks
+            caption_scores_list = []
+            
+            for i in range(0, batch_size, chunk_size):
+                end_idx = min(i + chunk_size, batch_size)
+                chunk_features = text_features[i:end_idx].view(-1, text_features.size(-1))
+                chunk_scores = actual_model.caption_scorer(chunk_features).squeeze()
+                chunk_scores = torch.sigmoid(chunk_scores).view(end_idx - i, valid_captions)
+                caption_scores_list.append(chunk_scores)
+            
+            caption_scores = torch.cat(caption_scores_list, dim=0)
             
             # Select best caption indices based on scores
             best_caption_idx = caption_scores.argmax(dim=1)
@@ -215,9 +243,9 @@ def select_best_captions_by_cosine_similarity(model, dataset, device, batch_size
             # Get model (handle DataParallel)
             actual_model = model.module if isinstance(model, nn.DataParallel) else model
             
-            # Handle different batch formats (CLIP vs OpenCLIP)
+            # Handle different batch formats (CLIP vs OpenCLIP vs SigLIP2)
             if 'pixel_values' in batch:
-                # CLIP format
+                # CLIP/SigLIP2 format
                 pixel_values = batch['pixel_values'].to(device)
                 input_ids = batch['input_ids'].to(device)  # [batch, max_captions, seq_len]
                 attention_mask = batch['attention_mask'].to(device)  # [batch, max_captions, seq_len]
@@ -226,8 +254,13 @@ def select_best_captions_by_cosine_similarity(model, dataset, device, batch_size
                 batch_size = pixel_values.size(0)
                 num_captions = input_ids.size(1)  # This is max_captions for the batch
                 
-                # Get image embeddings
-                image_embeddings = actual_model.clip_model.get_image_features(pixel_values=pixel_values)
+                # Get image embeddings - check if SigLIP2 or CLIP
+                if hasattr(actual_model, 'siglip_model'):
+                    # SigLIP2 model
+                    image_embeddings = actual_model.siglip_model.get_image_features(pixel_values=pixel_values)
+                else:
+                    # CLIP model
+                    image_embeddings = actual_model.clip_model.get_image_features(pixel_values=pixel_values)
                 
                 # Process each caption
                 text_embeddings_list = []
@@ -239,10 +272,19 @@ def select_best_captions_by_cosine_similarity(model, dataset, device, batch_size
                     if not is_valid_caption.any():
                         continue  # Skip if this caption position is all padding
                     
-                    text_embeddings = actual_model.clip_model.get_text_features(
-                        input_ids=input_ids[:, i],
-                        attention_mask=attention_mask[:, i]
-                    )
+                    # Get text embeddings - check if SigLIP2 or CLIP
+                    if hasattr(actual_model, 'siglip_model'):
+                        # SigLIP2 model
+                        text_embeddings = actual_model.siglip_model.get_text_features(
+                            input_ids=input_ids[:, i],
+                            attention_mask=attention_mask[:, i]
+                        )
+                    else:
+                        # CLIP model
+                        text_embeddings = actual_model.clip_model.get_text_features(
+                            input_ids=input_ids[:, i],
+                            attention_mask=attention_mask[:, i]
+                        )
                     text_embeddings_list.append(text_embeddings)
             else:
                 # OpenCLIP format
