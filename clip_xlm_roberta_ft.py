@@ -23,7 +23,7 @@ from caption_selection import select_best_captions
 from loss_functions import calculate_loss_gs, FocalLoss
 
 # Set seed for reproducibility
-seed = 42
+seed = 121
 random.seed(seed)
 np.random.seed(seed)
 torch.manual_seed(seed)
@@ -109,29 +109,31 @@ class CLIPClassifier(nn.Module):
         for param in self.clip_model.text.parameters():
             param.requires_grad = False
             
-        # image_encoder = self.clip_model.visual
+        image_encoder = self.clip_model.visual
         text_encoder = self.clip_model.text
 
         # Unfreeze last layer of image encoder
         # if hasattr(image_encoder, 'transformer'):
         #     # For transformer-based image encoders
-        #     for name, param in image_encoder.transformer.named_parameters():
-        #         if 'resblocks.23.' in name:  # Last transformer block
-        #             print(f"Unfreezing image encoder parameter: {name}")
-        #             param.requires_grad = True
+        #     for idx, block in enumerate(image_encoder.transformer.resblocks):
+        #         if idx in [len(image_encoder.transformer.resblocks)-5, len(image_encoder.transformer.resblocks)-10]:
+        #             print(f"Unfreezing image encoder transformer block {idx}")
+        #             for param in block.parameters():
+        #                 param.requires_grad = True
         # elif hasattr(image_encoder, 'layers'):
         #     # For layer-based image encoders
-        #     last_layer = image_encoder.layers[-1]
-        #     print(f"Unfreezing last image encoder layer")
-        #     for param in last_layer.parameters():
-        #         param.requires_grad = True
+        #     num_layers = len(image_encoder.layers)
+        #     for idx in [num_layers-5, num_layers-10]:
+        #         print(f"Unfreezing image encoder layer {idx}")
+        #         for param in image_encoder.layers[idx].parameters():
+        #             param.requires_grad = True
 
         # Unfreeze last layer of text encoder
         num_layers = len(text_encoder.transformer.encoder.layer)
         print(f"Number of text encoder layers: {num_layers}")
-        for layer in text_encoder.transformer.encoder.layer[num_layers-1:]:
-            print(f"Unfreezing text encoder layer {layer}")
-            for param in layer.parameters():
+        for idx in [num_layers-2, num_layers-5, num_layers-8, num_layers-11]:
+            print(f"Unfreezing text encoder layer {idx}")
+            for param in text_encoder.transformer.encoder.layer[idx].parameters():
                 param.requires_grad = True
 
         caption_scorer_input_dim = self.clip_model.text.output_dim
@@ -321,8 +323,8 @@ def evaluate_model(model, dataloaders, device):
 
     loss_config = {
         'classification': True,  # Always enabled
-        'contrastive': True,     # Set to False to disable contrastive loss
-        'relevance': False        # Set to False to disable relevance loss
+        'contrastive': False,     # Set to False to disable contrastive loss
+        'relevance': True        # Set to False to disable relevance loss
     }
 
     with torch.no_grad():
@@ -342,22 +344,25 @@ def evaluate_model(model, dataloaders, device):
                 total_loss += loss.item() * len(labels)
                 total_samples += len(labels)
                 
-                # Store probabilities for AUC calculation
+                # Store probabilities and labels for later threshold calculation
                 all_probs.extend(probs.cpu().numpy())
                 all_labels.extend(labels.cpu().numpy())
-                
-                precision, recall, thresholds = precision_recall_curve(labels.cpu().numpy(), probs.cpu().numpy())
-                f1_scores = 2 * precision * recall / (precision + recall + 1e-10)
-                threshold = thresholds[np.argmax(f1_scores)]
-
-                # Convert to binary predictions
-                preds = (probs >= threshold).float()
-                all_preds.extend(preds.cpu().numpy())
 
     # Convert to numpy arrays
-    all_preds = np.array(all_preds)
     all_labels = np.array(all_labels)
     all_probs = np.array(all_probs)
+
+    # Calculate optimal threshold on the full dataset (this avoids the warnings)
+    if len(np.unique(all_labels)) > 1:  # Check if we have both classes
+        precision, recall, thresholds = precision_recall_curve(all_labels, all_probs)
+        f1_scores = 2 * precision * recall / (precision + recall + 1e-10)
+        optimal_threshold = thresholds[np.argmax(f1_scores)]
+    else:
+        # If only one class is present, use default threshold
+        optimal_threshold = 0.5
+    
+    # Convert to binary predictions using the optimal threshold
+    all_preds = (all_probs >= optimal_threshold).astype(int)
 
     # Calculate average loss
     avg_loss = total_loss / total_samples
@@ -371,11 +376,11 @@ def evaluate_model(model, dataloaders, device):
         'f1': f"{f1_score(all_labels, all_preds, zero_division=0, average='macro'):.4f}",
         'auc': f"{roc_auc_score(all_labels, all_probs):.4f}"
     }
-    return metrics
+    return metrics, all_labels, all_preds
 
 def main():
-    # Enable memory efficient attention
-    os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'max_split_size_mb:512'
+    # Enable memory efficient attention and better memory management
+    os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True,max_split_size_mb:256'
     
     data_path = "/backup/girish_datasets/Hateful_Memes_Extended/ivl_plus_gemini_captions_complete.json"
     data = pd.read_json(data_path)
@@ -399,7 +404,7 @@ def main():
     test_dataset = MemeDatasetJSON(test_seen_data, preprocess, tokenizer)
     
     # Define actual batch size and gradient accumulation steps
-    actual_batch_size = 128
+    actual_batch_size = 64
     target_batch_size = 512
     accumulation_steps = target_batch_size // actual_batch_size
     
@@ -436,12 +441,17 @@ def main():
     
     if torch.cuda.device_count() > 1:
         print(f"Using {torch.cuda.device_count()} GPUs!")
+        # Use smaller batch size per GPU for DataParallel
+        actual_batch_size = actual_batch_size // torch.cuda.device_count()
+        accumulation_steps = target_batch_size // (actual_batch_size * torch.cuda.device_count())
+        print(f"Adjusted batch size per GPU: {actual_batch_size}, accumulation steps: {accumulation_steps}")
+        
         base_model = nn.DataParallel(base_model)
         # Make sure dataset is still accessible through DataParallel
         base_model.module.dataset = dataset
     
     optimizer = optim.AdamW(base_model.parameters(), lr=learning_rate, weight_decay=0.01)
-    scheduler = ReduceLROnPlateau(optimizer, mode='max', factor=0.1, patience=2, verbose=True)
+    scheduler = ReduceLROnPlateau(optimizer, mode='max', factor=0.1, patience=2)
     scaler = torch.amp.GradScaler(device=device)
 
     # Check for existing checkpoints
@@ -470,8 +480,8 @@ def main():
     # Define loss configuration for ablation experiments
     loss_config = {
         'classification': True,  # Always enabled
-        'contrastive': True,     # Set to False to disable contrastive loss
-        'relevance': False        # Set to False to disable relevance loss
+        'contrastive': False,     # Set to False to disable contrastive loss
+        'relevance': True        # Set to False to disable relevance loss
     }
     
     print(f"\nLoss configuration: {loss_config}")
@@ -488,10 +498,6 @@ def main():
         
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-        
-        print(f"\nEpoch {epoch+1}: Selecting best captions using current encoder state...")
-        train_best_captions = select_best_captions(base_model, dataset, device, loss_config)
-        dataset.best_captions = train_best_captions
         
         for batch_idx, batch in enumerate(tqdm(train_dataloader, desc=f"Epoch {epoch+1}/{num_epochs}")):
             if batch is None:
@@ -528,14 +534,8 @@ def main():
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         
-        # Select best captions for each validation dataset separately
-        print("Selecting best captions for validation...")
-        for val_dataset in val_datasets:
-            val_best_captions = select_best_captions(base_model, val_dataset, device, loss_config)
-            val_dataset.best_captions = val_best_captions
-        
         # Validation
-        val_metrics = evaluate_model(base_model, val_dataloaders, device)
+        val_metrics, _, _ = evaluate_model(base_model, val_dataloaders, device)
         print(f"Validation Metrics: {val_metrics}")
         
         wandb.log({
@@ -582,7 +582,7 @@ def main():
     test_dataset.best_captions = test_best_captions
 
     # Final evaluation
-    test_metrics = evaluate_model(base_model, [test_dataloader], device)
+    test_metrics, all_labels, all_preds = evaluate_model(base_model, [test_dataloader], device)
     print(f"Final Test Metrics: {test_metrics}")
 
     wandb.log({
@@ -592,6 +592,14 @@ def main():
         "Test F1": float(test_metrics['f1']),
         "Test ROC AUC": float(test_metrics['auc'])
     })
+
+    # Save all predictions and labels for further analysis
+    results = {
+        'labels': all_labels.tolist(),
+        'predictions': all_preds.tolist(),
+    }
+    with open('clip_xlm_preds.json', 'w') as f:
+        json.dump(results, f, indent=4)
 
     # Evaluate on test unseen set
     print("Evaluating on Test Unseen Set...")
@@ -603,7 +611,7 @@ def main():
     test_best_captions = select_best_captions(base_model, test_unseen_dataset, device, loss_config)
     test_unseen_dataset.best_captions = test_best_captions
     
-    test_unseen_metrics = evaluate_model(base_model, [test_unseen_dataloader], device)
+    test_unseen_metrics, _, _ = evaluate_model(base_model, [test_unseen_dataloader], device)
     print(f"Test Unseen Metrics: accuracy={test_unseen_metrics['accuracy']}, precision={test_unseen_metrics['precision']}, "
           f"recall={test_unseen_metrics['recall']}, f1={test_unseen_metrics['f1']}, auc={test_unseen_metrics['auc']}")
 
