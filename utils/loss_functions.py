@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from caption_selection import print_caption_selection_debug
+from utils.caption_selection import print_caption_selection_debug
 
 try:
     from __main__ import hf_tokenizer

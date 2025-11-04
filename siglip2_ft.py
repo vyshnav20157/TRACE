@@ -18,9 +18,9 @@ import random
 import torchvision.transforms as transforms
 import wandb
 
-# Import the new modules
-from caption_selection import select_best_captions
-from loss_functions import calculate_loss_gs, FocalLoss
+# Import the modules
+from utils.caption_selection import select_best_captions
+from utils.loss_functions import calculate_loss_gs, FocalLoss
 
 # Set seed for reproducibility
 seed = 42

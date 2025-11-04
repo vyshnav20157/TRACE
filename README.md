@@ -1,27 +1,29 @@
 # TRACE: Textual Relevance Augmentation and Contextual Encoding for Multimodal Hate Detection
 
+[![arXiv](https://img.shields.io/badge/arXiv-2510.01010-b31b1b.svg)](https://arxiv.org/abs/2504.17902)
+
 This repository contains the implementation for **TRACE** (Textual Relevance Augmentation and Contextual Encoding), a methodology for fine-tuning CLIP models for multimodal hate speech detection. It includes scripts for two primary tasks: the Facebook Hateful Memes (FHM) challenge and the MultiOFF (Multimodal Offensive Language) dataset.
 
-## Project Structure
+<!-- TRACE Visual Grounding and PEFT Pipelines -->
+<p align="center">
+  <img src="images/visual-grounding.png" alt="TRACE Visual Grounding" width="440"/>
+  <img src="images/peft.png" alt="TRACE PEFT" width="440"/>
+  <br/>
+  <em>Visual grounding (left) and parameter-efficient fine-tuning (right).</em>
+</p>
 
-All files in the main directory are implementations for the Facebook Hateful Memes (FHM) dataset.
+## Repository Structure
 
-- `clip_vitL_14_ft.py`: Main training script for CLIP-ViT-L/14 on FHM.
-- `clip_xlm_roberta_ft.py`: Main training script for CLIP-XLM-RoBERTa-Large on FHM.
-- `caption_selection.py`: Functions for selecting best captions during training.
-- `loss_functions.py`: Loss functions for different ablation settings.
-- `vg_caption_gen.py`: Generates rich captions for the FHM dataset.
-- `benco_eval.py`: Evaluates the fine-tuned model on benign confounders in the FHM test set.
-- `error_analysis.py`: Performs error analysis on specific mis-predicted samples from the FHM test set.
-- `lvlm_eval.py`: Zero-shot evaluation on the FHM test set using the InternVL2 model.
-- `gemini_eval.py`: Zero-shot evaluation on the FHM test set using the Gemini model.
-- `gpt-4o-eval.py`: Zero-shot evaluation on the FHM test set using the GPT-4o model.
-- `stats_significance.py`: Performs statistical significance tests (e.g., McNemar's test) between model predictions.
-- `MultiOFF/`: Contains scripts for the MultiOFF (offensive meme identification) dataset.
-    - `clip_roberta_multioff.py`: Training script for CLIP+RoBERTa on MultiOFF.
-    - `multioff_proj_ft.py`: Training script with a projection layer for MultiOFF.
-    - `multioff_cap_gen.py`: Caption generation for the MultiOFF dataset.
-    - `multioff_eval.py`: Evaluation script for models trained on MultiOFF.
+- `clip_vitL_14_ft.py`: Main TRACE finetuning pipeline on FHM.
+- `clip_xlm_roberta_ft.py`: CLIP-XLM-RoBERTa finetuning for FHM.
+- `siglip2_ft.py`: SigLIP2-based TRACE variant for FHM.
+- `vg_caption_gen.py`: Caption generation workflow for FHM.
+- `benco_eval.py`, `error_analysis.py`: Post-hoc FHM analyses.
+- `plot_auroc_vs_nlayers.py`: Visualization utilities.
+- `images/`: Figures used in documentation.
+- `MultiOFF/`: MultiOFF training, captioning, evaluation scripts.
+- `utils/`: Shared helpers such as [`utils.caption_selection.select_best_captions`](utils/caption_selection.py) and [`utils.loss_functions.calculate_loss_gs`](utils/loss_functions.py).
+- `zero-shot-eval/`: Zero-shot evaluation scripts on FHM.
 
 ## Setup
 
@@ -71,6 +73,11 @@ python clip_vitL_14_ft.py
 **For CLIP-XLM-RoBERTa-Large:**
 ```bash
 python clip_xlm_roberta_ft.py
+```
+
+**For SigLIP2:**
+```bash
+python siglip2_ft.py
 ```
 
 ### MultiOFF Dataset
@@ -150,7 +157,7 @@ These scripts evaluate the zero-shot capabilities of various large vision-langua
 ### Statistical Significance
 To run statistical significance tests between two models' prediction files, use `stats_significance.py`. You will need to provide paths to the prediction files inside the script.
 ```bash
-python stats_significance.py
+python utils/stats-significance.py
 ```
 
 ## Dataset Format
@@ -193,3 +200,21 @@ The data format for the MultiOFF dataset is handled by the scripts within the `M
 4. **Evaluate the Fine-tuned Model**:
    - Modify `benco_eval.py` or `error_analysis.py` to point to your saved model checkpoint.
    - Run the evaluation script: `python benco_eval.py`.
+
+## Citation
+If you use this repository, please cite the paper:
+
+```
+@article{koushik2025camucontextaugmentationmeme,
+      title={CAMU: Context Augmentation for Meme Understanding}, 
+      author={Girish A. Koushik and Diptesh Kanojia and Helen Treharne and Aditya Joshi},
+      year={2025},
+      eprint={2504.17902},
+      archivePrefix={arXiv},
+      primaryClass={cs.CV},
+      url={https://arxiv.org/abs/2504.17902}, 
+}
+```
+
+## License
+This code is released under the MIT License. See `LICENSE` for details.
