@@ -6,8 +6,8 @@ This repository contains the implementation for **TRACE** (Textual Relevance Aug
 
 <!-- TRACE Visual Grounding and PEFT Pipelines -->
 <p align="center">
-  <img src="images/visual-grounding.png" alt="TRACE Visual Grounding" width="440"/>
-  <img src="images/peft.png" alt="TRACE PEFT" width="440"/>
+  <img src="images/visual-grounding.png" alt="TRACE Visual Grounding" width="400"/>
+  <img src="images/peft.png" alt="TRACE PEFT" width="400"/>
   <br/>
   <em>Visual grounding (left) and parameter-efficient fine-tuning (right).</em>
 </p>
@@ -19,8 +19,7 @@ This repository contains the implementation for **TRACE** (Textual Relevance Aug
 - `siglip2_ft.py`: SigLIP2-based TRACE variant for FHM.
 - `vg_caption_gen.py`: Caption generation workflow for FHM.
 - `benco_eval.py`, `error_analysis.py`: Post-hoc FHM analyses.
-- `plot_auroc_vs_nlayers.py`: Visualization utilities.
-- `images/`: Figures used in documentation.
+- `images/`: Figures used in the paper.
 - `MultiOFF/`: MultiOFF training, captioning, evaluation scripts.
 - `utils/`: Shared helpers such as [`utils.caption_selection.select_best_captions`](utils/caption_selection.py) and [`utils.loss_functions.calculate_loss_gs`](utils/loss_functions.py).
 - `zero-shot-eval/`: Zero-shot evaluation scripts on FHM.
