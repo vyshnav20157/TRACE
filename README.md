@@ -2,7 +2,9 @@
 
 [![arXiv](https://img.shields.io/badge/arXiv-2510.01010-b31b1b.svg)](https://arxiv.org/abs/2504.17902)
 
-This repository contains the implementation for **TRACE** (Textual Relevance Augmentation and Contextual Encoding), a methodology for fine-tuning CLIP models for multimodal hate speech detection. It includes scripts for two primary tasks: the Facebook Hateful Memes (FHM) challenge and the MultiOFF (Multimodal Offensive Language) dataset.
+This repository contains the implementation for **TRACE** (Textual Relevance Augmentation and Contextual Encoding), a methodology for fine-tuning CLIP models for multimodal hate speech detection. **Accepted to the Special Track on AI for Social Impact (AISI) at AAAI 2026.**
+
+It includes scripts for two primary tasks: the Facebook Hateful Memes (FHM) challenge and the MultiOFF (Multimodal Offensive Language) dataset.
 
 <!-- TRACE Visual Grounding and PEFT Pipelines -->
 <p align="center">
@@ -204,9 +206,9 @@ The data format for the MultiOFF dataset is handled by the scripts within the `M
 If you use this repository, please cite the paper:
 
 ```
-@article{koushik2025camucontextaugmentationmeme,
-      title={CAMU: Context Augmentation for Meme Understanding}, 
-      author={Girish A. Koushik and Diptesh Kanojia and Helen Treharne and Aditya Joshi},
+@article{koushik2025tracetextualrelevanceaugmentation,
+      title={TRACE: Textual Relevance Augmentation and Contextual Encoding for Multimodal Hate Detection}, 
+      author={Girish A. Koushik and Helen Treharne and Aditya Joshi and Diptesh Kanojia},
       year={2025},
       eprint={2504.17902},
       archivePrefix={arXiv},
