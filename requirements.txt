@@ -22,7 +22,9 @@ cfgv==3.4.0
 charset-normalizer==3.3.2
 clarabel==0.9.0
 click==8.1.7
-clip @ git+https://github.com/openai/CLIP.git@dcba3cb2e2827b402d2701e7e1c7d9fed8a20ef1
+
+#clip @ git+https://github.com/openai/CLIP.git@dcba3cb2e2827b402d2701e7e1c7d9fed8a20ef1
+
 cloudpathlib==0.19.0
 cmake==3.30.2
 confection==0.1.5
@@ -45,7 +47,10 @@ exceptiongroup==1.2.2
 executing==2.1.0
 fairscale==0.4.4
 filelock==3.15.4
-flash-attn==2.6.3
+
+
+#flash-attn==2.6.3
+
 fonttools==4.53.1
 frozenlist==1.4.1
 fsspec==2024.6.1
