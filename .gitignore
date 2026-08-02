@@ -9,4 +9,5 @@ __pycache__/
 wandb/
 .vscode/
 
-ThingsToDo.txt
+ToDo.md
+HowToRequirements.md
