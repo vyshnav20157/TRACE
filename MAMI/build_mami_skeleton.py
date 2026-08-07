@@ -6,11 +6,11 @@ Misogyny Identification) dataset. The captioning script (`MAMI/mami_cap_gen.py`)
 training script (`MAMI/train_mami.py`) both read a single JSON (records orient) with the
 columns:
 
-    img, text, label, split, ivl_8b_new_caption, gemini_caption
+    img, text, label, split, ivl_8b_new_caption
 
 exactly like the FHM flow, so the shared model/dataset/loss code is reused unchanged.
-Caption fields start empty and are backfilled by the caption pipeline (InternVL ->
-ivl_8b_new_caption on the GPU server, Gemini -> gemini_caption on a local machine).
+The caption field starts empty and is backfilled by the caption pipeline (InternVL ->
+ivl_8b_new_caption). Captioning is InternVL-only, as for Memotion and MMSD.
 
 MAMI ships three TSV files with columns:
     file_name, label, shaming, stereotype, objectification, violence, text
@@ -53,7 +53,9 @@ SPLIT_FILES = {
 }
 
 # Caption fields the downstream scripts read. Start empty; backfilled by the pipeline.
-CAPTION_FIELDS = ["ivl_8b_new_caption", "gemini_caption"]
+# InternVL-only: `ivl_8b_new_caption` is what the misogyny (primary) prompt writes. The
+# `--prompt all|generic` ablation variants add their own fields at merge time.
+CAPTION_FIELDS = ["ivl_8b_new_caption"]
 
 # MAMI sub-category columns -- preserved but not modeled (Task B is out of scope).
 SUBLABEL_FIELDS = ["shaming", "stereotype", "objectification", "violence"]
@@ -153,8 +155,8 @@ def main():
     data.to_json(args.output, orient="records", indent=2)
     print(f"\nWrote skeleton JSON -> {args.output}")
     print(
-        "Caption fields (ivl_8b_new_caption, gemini_caption) are empty and ready to "
-        "backfill via MAMI/mami_cap_gen.py."
+        "Caption field (ivl_8b_new_caption) is empty and ready to backfill via "
+        "MAMI/mami_cap_gen.py."
     )
 
 

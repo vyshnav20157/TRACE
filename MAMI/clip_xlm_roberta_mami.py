@@ -14,7 +14,6 @@ from tqdm import tqdm
 import open_clip
 import numpy as np
 import pandas as pd
-from sklearn.metrics import accuracy_score, precision_recall_curve, roc_auc_score, f1_score, precision_score, recall_score
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 import random
 import torchvision.transforms as transforms
@@ -23,6 +22,7 @@ import argparse
 
 # MAMI shared config (also puts the repo root on sys.path for the utils imports below).
 from mami_common import MAMI_IMAGE_ROOT, MAMI_DATA_PATH, split_mami_data
+from mami_metrics import SELECTION_METRIC, compute_metrics, format_metrics, wandb_metrics
 
 # Import the modules
 from utils.caption_selection import select_best_captions
@@ -47,11 +47,18 @@ model, _, preprocess = open_clip.create_model_and_transforms(model_name, pretrai
 tokenizer = open_clip.get_tokenizer(model_name)
 hf_tokenizer = tokenizer.tokenizer
 
+# Caption field the dataset reads alongside the meme's own OCR text. The misogyny prompt
+# (the primary) writes this field; the --caption-field flag points training at the unified
+# or generic caption sets instead, for the caption-specialization ablation.
+CAPTION_FIELD = "ivl_8b_new_caption"
+
+
 class MemeDatasetJSON(Dataset):
-    def __init__(self, dataframe, preprocess_fn, tokenizer):
+    def __init__(self, dataframe, preprocess_fn, tokenizer, caption_field=CAPTION_FIELD):
         self.data = dataframe.to_dict(orient='records')
         self.preprocess = preprocess_fn
         self.tokenizer = tokenizer
+        self.caption_field = caption_field
         self.images = {}
         self.captions = defaultdict(list)
         self.best_captions = {}
@@ -65,10 +72,15 @@ class MemeDatasetJSON(Dataset):
 
                 captions = [
                     str(row.get('text', 'No caption')),
-                    str(row.get('ivl_8b_new_caption', 'No caption')),
-                    str(row.get('gemini_caption', 'No caption'))
+                    str(row.get(self.caption_field, 'No caption'))
                 ]
-                captions = [cap for cap in captions if cap.strip()]
+                captions = [cap for cap in captions
+                            if cap.strip() and cap.strip().lower() not in ('nan', 'none')]
+                if not captions:
+                    # A meme with neither usable OCR text nor a caption would otherwise
+                    # hand the tokenizer an empty list and raise IndexError. Keep the
+                    # sample (dropping it would silently alter the official split).
+                    captions = ['No caption']
                 self.captions[image_id] = captions
             else:
                 print(f"Image file {image_path} not found.")
@@ -358,31 +370,11 @@ def evaluate_model(model, dataloaders, device):
     all_labels = np.array(all_labels)
     all_probs = np.array(all_probs)
 
-    # Calculate optimal threshold on the full dataset (this avoids the warnings)
-    if len(np.unique(all_labels)) > 1:  # Check if we have both classes
-        precision, recall, thresholds = precision_recall_curve(all_labels, all_probs)
-        f1_scores = 2 * precision * recall / (precision + recall + 1e-10)
-        optimal_threshold = thresholds[np.argmax(f1_scores)]
-    else:
-        # If only one class is present, use default threshold
-        optimal_threshold = 0.5
-    
-    # Convert to binary predictions using the optimal threshold
-    all_preds = (all_probs >= optimal_threshold).astype(int)
-
-    # Calculate average loss
     avg_loss = total_loss / total_samples
 
-    # Calculate metrics
-    metrics = {
-        'loss': f"{avg_loss:.4f}",
-        'accuracy': f"{accuracy_score(all_labels, all_preds):.4f}",
-        'precision': f"{precision_score(all_labels, all_preds, zero_division=0, average='macro'):.4f}",
-        'recall': f"{recall_score(all_labels, all_preds, zero_division=0, average='macro'):.4f}",
-        'f1': f"{f1_score(all_labels, all_preds, zero_division=0, average='macro'):.4f}",
-        'auc': f"{roc_auc_score(all_labels, all_probs):.4f}"
-    }
-    return metrics, all_labels, all_preds
+    # MAMI-official macro-F1 @ 0.5 (the SemEval-2022 Task 5A ranking metric) plus the
+    # TRACE-style tuned-threshold metrics and AUROC. See MAMI/mami_metrics.py.
+    return compute_metrics(all_labels, all_probs, avg_loss=avg_loss)
 
 def main(args=None):
     if args is None:
@@ -403,9 +395,9 @@ def main(args=None):
 
     # Make dataset accessible globally for logging
     global dataset
-    dataset = MemeDatasetJSON(train_data, preprocess, tokenizer)
-    val_datasets = [MemeDatasetJSON(val_data, preprocess, tokenizer)]
-    test_dataset = MemeDatasetJSON(test_data, preprocess, tokenizer)
+    dataset = MemeDatasetJSON(train_data, preprocess, tokenizer, args.caption_field)
+    val_datasets = [MemeDatasetJSON(val_data, preprocess, tokenizer, args.caption_field)]
+    test_dataset = MemeDatasetJSON(test_data, preprocess, tokenizer, args.caption_field)
 
     # Define actual batch size and gradient accumulation steps
     actual_batch_size = 64
@@ -465,15 +457,18 @@ def main(args=None):
     checkpoint_path = os.path.join(checkpoint_dir, 'mami_roberta_best_model.pth')
 
     start_epoch = 0
-    best_val_auc = 0
-    if os.path.exists(checkpoint_path):
+    # Model selection follows the MAMI-official metric (macro-F1 @ 0.5), not AUROC.
+    best_val_score = 0
+    if os.path.exists(checkpoint_path) and not args.no_resume:
         print("Found existing checkpoint. Loading...")
         checkpoint = torch.load(checkpoint_path)
         base_model.load_state_dict(checkpoint['model_state_dict'])
         optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         start_epoch = checkpoint['epoch']
-        best_val_auc = checkpoint['best_val_auc']
-        print(f"Resuming from epoch {start_epoch} with validation AUC: {best_val_auc:.4f}")
+        # 'best_val_score' is the current key; fall back to older AUROC-selected
+        # checkpoints, whose stored value is on a different scale but still a sane floor.
+        best_val_score = checkpoint.get('best_val_score', checkpoint.get('best_val_auc', 0))
+        print(f"Resuming from epoch {start_epoch} with validation {SELECTION_METRIC}: {best_val_score:.4f}")
     else:
         print("No checkpoint found. Starting fresh training.")
 
@@ -542,24 +537,21 @@ def main(args=None):
         
         # Validation
         val_metrics, _, _ = evaluate_model(base_model, val_dataloaders, device)
-        print(f"Validation Metrics: {val_metrics}")
+        print("Validation Metrics:")
+        print(format_metrics(val_metrics, prefix="  "))
 
         if args.wandb:
-            wandb.log({
-                "Validation Accuracy": float(val_metrics['accuracy']),
-                "Validation Precision": float(val_metrics['precision']),
-                "Validation Recall": float(val_metrics['recall']),
-                "Validation F1": float(val_metrics['f1']),
-                "Validation ROC AUC": float(val_metrics['auc'])
-            })
-        
-        current_val_auc = float(val_metrics['auc'])
-        scheduler.step(current_val_auc)
-        
-        if current_val_auc > best_val_auc:
-            best_val_auc = current_val_auc
+            wandb.log(wandb_metrics(val_metrics, "Validation"))
+
+        # Select on the MAMI-official metric (macro-F1 @ 0.5) rather than AUROC.
+        current_val_score = float(val_metrics[SELECTION_METRIC])
+        scheduler.step(current_val_score)
+
+        if current_val_score > best_val_score:
+            best_val_score = current_val_score
             best_model_state = copy.deepcopy(base_model.state_dict())
             epochs_without_improvement = 0
+            print(f"New best model with validation {SELECTION_METRIC}: {best_val_score:.4f}")
         else:
             epochs_without_improvement += 1
             if epochs_without_improvement >= patience:
@@ -571,7 +563,7 @@ def main(args=None):
             'epoch': epoch + 1,
             'model_state_dict': base_model.state_dict(),
             'optimizer_state_dict': optimizer.state_dict(),
-            'best_val_auc': best_val_auc,
+            'best_val_score': best_val_score,
             'val_metrics': val_metrics,
         }
         torch.save(checkpoint, checkpoint_path)
@@ -580,8 +572,11 @@ def main(args=None):
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-    # Load the best model state
-    base_model.load_state_dict(best_model_state)
+    # Load the best model state. It stays None if no epoch ever improved on the initial
+    # score (e.g. a 1-epoch smoke run scoring 0.0), in which case the final weights are
+    # already the ones to evaluate.
+    if best_model_state is not None:
+        base_model.load_state_dict(best_model_state)
 
     # Select best captions for test set
     print("\nSelecting best captions for test set...")
@@ -590,16 +585,11 @@ def main(args=None):
 
     # Final evaluation on the MAMI test split.
     test_metrics, all_labels, all_preds = evaluate_model(base_model, [test_dataloader], device)
-    print(f"Final Test Metrics: {test_metrics}")
+    print("Final Test Metrics:")
+    print(format_metrics(test_metrics, prefix="  "))
 
     if args.wandb:
-        wandb.log({
-            "Test Accuracy": float(test_metrics['accuracy']),
-            "Test Precision": float(test_metrics['precision']),
-            "Test Recall": float(test_metrics['recall']),
-            "Test F1": float(test_metrics['f1']),
-            "Test ROC AUC": float(test_metrics['auc'])
-        })
+        wandb.log(wandb_metrics(test_metrics, "Test"))
 
     # Save all predictions and labels for further analysis
     results = {
@@ -618,6 +608,11 @@ def parse_args():
     parser.add_argument('--subset', type=int, default=None,
                         help="Train on the first N train rows (val/test scaled down) for smoke tests.")
     parser.add_argument('--wandb', action='store_true', help="Enable Weights & Biases logging.")
+    parser.add_argument('--no-resume', dest='no_resume', action='store_true',
+                        help="Ignore an existing checkpoint and start training from scratch.")
+    parser.add_argument('--caption-field', dest='caption_field', default=CAPTION_FIELD,
+                        help="JSON field holding the generated caption (default: ivl_8b_new_caption). "
+                             "Use ivl_caption_unified / ivl_caption_generic for the prompt ablation.")
     return parser.parse_args()
 
 

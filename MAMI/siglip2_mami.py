@@ -11,10 +11,9 @@ import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 from PIL import Image
 from tqdm import tqdm
-from transformers import AutoProcessor, AutoModel
+from transformers import AutoImageProcessor, AutoModel, AutoProcessor, AutoTokenizer
 import numpy as np
 import pandas as pd
-from sklearn.metrics import accuracy_score, precision_recall_curve, roc_auc_score, f1_score, precision_score, recall_score
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 import random
 import torchvision.transforms as transforms
@@ -23,6 +22,7 @@ import argparse
 
 # MAMI shared config (also puts the repo root on sys.path for the utils imports below).
 from mami_common import MAMI_IMAGE_ROOT, MAMI_DATA_PATH, split_mami_data
+from mami_metrics import SELECTION_METRIC, compute_metrics, format_metrics, wandb_metrics
 
 # Import the modules
 from utils.caption_selection import select_best_captions
@@ -38,13 +38,59 @@ if torch.cuda.is_available():
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+SIGLIP2_MODEL = "google/siglip2-large-patch16-384"
+
+
+class _SigLIP2Processor:
+    """Minimal image+text processor for SigLIP2, pairing its Gemma tokenizer by hand.
+
+    SigLIP2 ships a Gemma tokenizer with only `tokenizer.json` (no `spiece.model`), but
+    this transformers version maps the checkpoint to the *slow* `SiglipTokenizer`, which
+    requires a sentencepiece vocab file -- so `AutoProcessor.from_pretrained(...)` dies with
+    `TypeError: expected str, bytes or os.PathLike object, not NoneType`, and
+    `SiglipProcessor` separately refuses a `GemmaTokenizerFast`. Loading the fast tokenizer
+    and image processor independently and pairing them here sidesteps both checks.
+
+    This is the environment-level bug documented in CONTRIBUTIONS.md; the shim is carried
+    over verbatim from `Memotion/siglip2_memotion.py` / `MMSD/siglip2_mmsd.py`, where it is
+    already verified. It tries `AutoProcessor` first, so it self-heals on a newer
+    transformers.
+
+    Exposes only the two call shapes the dataset uses: `(images=...)` and `(text=...)`.
+    The Gemma tokenizer returns no `attention_mask`; `MemeDatasetJSON.__getitem__` already
+    synthesizes one from the non-pad tokens.
+    """
+
+    def __init__(self, model_name=SIGLIP2_MODEL):
+        try:
+            processor = AutoProcessor.from_pretrained(model_name)
+            self.image_processor = processor.image_processor
+            self.tokenizer = processor.tokenizer
+        except Exception as e:  # noqa: BLE001
+            print(f"AutoProcessor failed ({type(e).__name__}); falling back to the Gemma tokenizer pairing.")
+            self.image_processor = AutoImageProcessor.from_pretrained(model_name)
+            self.tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True, tokenizer_type="gemma")
+
+    def __call__(self, images=None, text=None, return_tensors=None, **kwargs):
+        if images is not None and text is None:
+            return self.image_processor(images=images, return_tensors=return_tensors)
+        return self.tokenizer(text, return_tensors=return_tensors, **kwargs)
+
+
 # Use SigLIP2 model
-siglip_processor = AutoProcessor.from_pretrained("google/siglip2-large-patch16-384")
+siglip_processor = _SigLIP2Processor()
+
+# Caption field the dataset reads alongside the meme's own OCR text. The misogyny prompt
+# (the primary) writes this field; the --caption-field flag points training at the unified
+# or generic caption sets instead, for the caption-specialization ablation.
+CAPTION_FIELD = "ivl_8b_new_caption"
+
 
 class MemeDatasetJSON(Dataset):
-    def __init__(self, dataframe, processor):
+    def __init__(self, dataframe, processor, caption_field=CAPTION_FIELD):
         self.data = dataframe.to_dict(orient='records')
         self.processor = processor
+        self.caption_field = caption_field
         self.images = {}
         self.captions = defaultdict(list)
         self.best_captions = {}
@@ -58,10 +104,15 @@ class MemeDatasetJSON(Dataset):
 
                 captions = [
                     str(row.get('text', 'No caption')),
-                    str(row.get('ivl_8b_new_caption', 'No caption')),
-                    str(row.get('gemini_caption', 'No caption'))
+                    str(row.get(self.caption_field, 'No caption'))
                 ]
-                captions = [cap for cap in captions if cap.strip()]
+                captions = [cap for cap in captions
+                            if cap.strip() and cap.strip().lower() not in ('nan', 'none')]
+                if not captions:
+                    # A meme with neither usable OCR text nor a caption would otherwise
+                    # hand the tokenizer an empty list and raise IndexError. Keep the
+                    # sample (dropping it would silently alter the official split).
+                    captions = ['No caption']
                 self.captions[image_id] = captions
             else:
                 print(f"Image file {image_path} not found.")
@@ -116,7 +167,7 @@ class SigLIP2Classifier(nn.Module):
     def __init__(self, projection_dim=1024, num_classes=1, fusion_type='cross_attn'):
         super(SigLIP2Classifier, self).__init__()
         # Use SigLIP2 model
-        self.siglip_model = AutoModel.from_pretrained("google/siglip2-large-patch16-384")
+        self.siglip_model = AutoModel.from_pretrained(SIGLIP2_MODEL)
         self.fusion_type = fusion_type
         
         # Initialize learnable loss weights
@@ -391,29 +442,14 @@ def evaluate_model(model, dataloaders, device, loss_config):
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
 
-    # Compute metrics
-    precision, recall, thresholds = precision_recall_curve(all_labels, all_probs)
-    f1_scores = 2 * precision * recall / (precision + recall + 1e-10)
-    threshold = thresholds[np.argmax(f1_scores)]
-
     # Calculate average loss
     avg_loss = total_loss / total_samples
 
-    preds_binary = (np.array(all_probs) >= threshold).astype(int)
-    accuracy = accuracy_score(all_labels, preds_binary)
-    precision = precision_score(all_labels, preds_binary, zero_division=0, average='macro')
-    recall = recall_score(all_labels, preds_binary, zero_division=0, average='macro')
-    f1 = f1_score(all_labels, preds_binary, zero_division=0, average='macro')
-    auc = roc_auc_score(all_labels, all_probs)
-
-    metrics = {
-        'loss': f"{avg_loss:.4f}",
-        'accuracy': f"{accuracy:.4f}",
-        'precision': f"{precision:.4f}",
-        'recall': f"{recall:.4f}",
-        'f1': f"{f1:.4f}",
-        'auc': f"{auc:.4f}"
-    }
+    # MAMI-official macro-F1 @ 0.5 (the SemEval-2022 Task 5A ranking metric) plus the
+    # TRACE-style tuned-threshold metrics and AUROC. See MAMI/mami_metrics.py.
+    metrics, all_labels, preds_binary = compute_metrics(all_labels, all_probs, avg_loss=avg_loss)
+    # This backbone's callers unpack (metrics, preds, labels) -- the opposite order to
+    # clip_xlm_roberta_mami.evaluate_model -- so keep that contract.
     return metrics, preds_binary, all_labels
 
 def train_epoch(model, train_dataloader, optimizer, device, accumulation_steps, loss_config, current_temp=1.0):
@@ -456,9 +492,9 @@ def main(args=None):
         val_data = val_data.sample(n=min(max(args.subset // 5, 1), len(val_data)), random_state=42)
         test_data = test_data.sample(n=min(max(args.subset // 5, 1), len(test_data)), random_state=42)
 
-    train_dataset = MemeDatasetJSON(train_data, siglip_processor)
-    val_datasets = [MemeDatasetJSON(val_data, siglip_processor)]
-    test_dataset = MemeDatasetJSON(test_data, siglip_processor)
+    train_dataset = MemeDatasetJSON(train_data, siglip_processor, args.caption_field)
+    val_datasets = [MemeDatasetJSON(val_data, siglip_processor, args.caption_field)]
+    test_dataset = MemeDatasetJSON(test_data, siglip_processor, args.caption_field)
 
     # Enable memory efficient attention
     os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'max_split_size_mb:512'
@@ -528,9 +564,10 @@ def main(args=None):
     checkpoint_path = os.path.join(checkpoint_dir, 'mami_siglip2_best_model.pth')
     
     start_epoch = 0
-    best_val_auc = 0
+    # Model selection follows the MAMI-official metric (macro-F1 @ 0.5), not AUROC.
+    best_val_score = 0
     
-    if os.path.exists(checkpoint_path):
+    if os.path.exists(checkpoint_path) and not args.no_resume:
         print("Found existing checkpoint. Loading...")
         try:
             checkpoint = torch.load(checkpoint_path)
@@ -546,8 +583,8 @@ def main(args=None):
             if len(missing_keys) == 0 and len(unexpected_keys) == 0:
                 optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
                 start_epoch = checkpoint['epoch']
-                best_val_auc = checkpoint['best_val_auc']
-                print(f"Resuming from epoch {start_epoch} with validation AUC: {best_val_auc:.4f}")
+                best_val_score = checkpoint.get('best_val_score', checkpoint.get('best_val_auc', 0))
+                print(f"Resuming from epoch {start_epoch} with validation {SELECTION_METRIC}: {best_val_score:.4f}")
             else:
                 print("Architecture mismatch detected. Starting fresh training with new model architecture.")
         except Exception as e:
@@ -622,31 +659,25 @@ def main(args=None):
             model.module if isinstance(model, nn.DataParallel) else model, 
             val_dataloaders, device, loss_config
         )
-        print(f"Validation Loss: {val_metrics['loss']}")
-        print(f"Validation Metrics: accuracy={val_metrics['accuracy']}, precision={val_metrics['precision']}, "
-              f"recall={val_metrics['recall']}, f1={val_metrics['f1']}, auc={val_metrics['auc']}")
+        print("Validation Metrics:")
+        print(format_metrics(val_metrics, prefix="  "))
         
-        # wandb.log({
-        #     "Validation Accuracy": round(float(val_metrics['accuracy']), 4),
-        #     "Validation Precision": round(float(val_metrics['precision']), 4),
-        #     "Validation Recall": round(float(val_metrics['recall']), 4),
-        #     "Validation F1": round(float(val_metrics['f1']), 4),
-        #     "Validation ROC AUC": round(float(val_metrics['auc']), 4)
-        # })
-        
-        current_val_auc = float(val_metrics['auc'])
-        scheduler.step(current_val_auc)
+        # wandb.log(wandb_metrics(val_metrics, "Validation"))
+
+        # Select on the MAMI-official metric (macro-F1 @ 0.5) rather than AUROC.
+        current_val_score = float(val_metrics[SELECTION_METRIC])
+        scheduler.step(current_val_score)
         
         # Print current learning rate
         current_lr = optimizer.param_groups[0]['lr']
         print(f"Current learning rate: {current_lr:.6f}")
         # wandb.log({"Learning Rate": current_lr})
         
-        if current_val_auc > best_val_auc:
-            best_val_auc = current_val_auc
+        if current_val_score > best_val_score:
+            best_val_score = current_val_score
             best_epoch = epoch + 1
             epochs_without_improvement = 0
-            print(f"New best model with validation AUC: {best_val_auc:.4f}")
+            print(f"New best model with validation {SELECTION_METRIC}: {best_val_score:.4f}")
         else:
             epochs_without_improvement += 1
             if epochs_without_improvement >= patience:
@@ -658,7 +689,7 @@ def main(args=None):
             'epoch': epoch + 1,
             'model_state_dict': model.state_dict(),
             'optimizer_state_dict': optimizer.state_dict(),
-            'best_val_auc': best_val_auc,
+            'best_val_score': best_val_score,
             'val_metrics': val_metrics,
         }
         torch.save(checkpoint, checkpoint_path)
@@ -672,16 +703,10 @@ def main(args=None):
     # Evaluate on test set
     print("Evaluating on Test Set...")
     test_metrics, test_preds, test_labels = evaluate_model(model, [test_dataloader], device, loss_config)
-    print(f"Test Metrics: accuracy={test_metrics['accuracy']}, precision={test_metrics['precision']}, "
-          f"recall={test_metrics['recall']}, f1={test_metrics['f1']}, auc={test_metrics['auc']}")
+    print("Test Metrics:")
+    print(format_metrics(test_metrics, prefix="  "))
 
-    # wandb.log({
-    #     "Test Accuracy": round(float(test_metrics['accuracy']), 4),
-    #     "Test Precision": round(float(test_metrics['precision']), 4),
-    #     "Test Recall": round(float(test_metrics['recall']), 4),
-    #     "Test F1": round(float(test_metrics['f1']), 4),
-    #     "Test ROC AUC": round(float(test_metrics['auc']), 4)
-    # })
+    # wandb.log(wandb_metrics(test_metrics, "Test"))
 
     # Save all predictions and labels for test set
     test_results = {
@@ -701,6 +726,11 @@ def parse_args():
                         help="Train on the first N train rows (val/test scaled down) for smoke tests.")
     parser.add_argument('--wandb', action='store_true',
                         help="(Accepted for parity; SigLIP2 wandb logging is disabled in-script.)")
+    parser.add_argument('--no-resume', dest='no_resume', action='store_true',
+                        help="Ignore an existing checkpoint and start training from scratch.")
+    parser.add_argument('--caption-field', dest='caption_field', default=CAPTION_FIELD,
+                        help="JSON field holding the generated caption (default: ivl_8b_new_caption). "
+                             "Use ivl_caption_unified / ivl_caption_generic for the prompt ablation.")
     return parser.parse_args()
 
 

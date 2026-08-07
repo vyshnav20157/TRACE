@@ -1,65 +1,75 @@
-"""MAMI caption generation: RAM++ tags -> GroundingDINO boxes -> InternVL caption.
+"""
+MMSD2.0 caption generation: RAM++ tags -> GroundingDINO boxes -> InternVL caption.
 
-This mirrors `MMSD/mmsd_cap_gen.py` but is driven by the MAMI skeleton JSON produced by
-`MAMI/build_mami_skeleton.py`. As with Memotion and MMSD, Gemini is not part of this flow:
-only InternVL runs, on the local GPU. No API key is required.
+This mirrors `Memotion/memotion_cap_gen.py` but is driven by the MMSD skeleton JSON produced
+by `MMSD/build_mmsd_skeleton.py`. As with Memotion, Gemini is not part of this flow: only
+InternVL runs, on the local GPU, backfilling `ivl_8b_new_caption`. No API key is required.
 
 Prompts
 -------
-MAMI is a single task -- misogyny identification -- so the default `--prompt misogyny` uses
-the MISOGYNY prompt from `prompts.md`, which foregrounds exactly what this dataset turns on:
-the portrayed role of any depicted women, and any gender-related comparison, insult,
-stereotype, or objectification the text and image jointly express.
+MMSD2.0 is a single task -- multimodal sarcasm detection -- so unlike Memotion there is no
+per-task prompt matrix. The default `--prompt sarcasm` uses the SARCASM prompt from
+`prompts.md`, which foregrounds exactly the signal this dataset turns on: the observable
+incongruity between what the text claims and what the image shows, plus the linguistic
+markers (hyperbole, rhetorical questions, exaggerated praise, understatement) that carry
+sarcasm in tweet text.
 
 `--prompt all` (the UNIFIED prompt) and `--prompt generic` are also available, so the
-caption-specialization ablation run for Memotion/MMSD can be repeated here: each variant
-writes to its OWN field (`ivl_caption_unified`, `ivl_caption_generic`) so it never clobbers
-the primary caption, and training picks it up via `--caption-field`.
+caption-specialization ablation run for Memotion can be repeated here: each variant writes
+to its OWN field (`ivl_caption_unified`, `ivl_caption_generic`) so it never clobbers the
+primary caption, and training picks it up via `--caption-field`.
 
 Prompt wording is verbatim from `prompts.md` at the repo root, which is the single source of
 truth -- keep the two in sync when either changes. The 40-word cap in each prompt is sized
 to the tightest text encoder in the pipeline (SigLIP2, 64 tokens); see CAPTION_TOKEN_BUDGET
 below, which enforces the same budget at generation time.
 
-Every prompt asks for descriptive language and forbids verdict labels ("this is
-misogynistic", "this is sexist") -- the classifier must infer the label, so a caption that
-states it would leak the target.
+Every prompt asks for descriptive language and forbids verdict labels ("this is sarcastic",
+"this is ironic") -- the classifier must infer the label, so a caption that states it would
+leak the target.
+
+A note on MMSD's images: these are Twitter photos, not image macros, so the RAM++ /
+GroundingDINO grounding stage carries more of the weight than it does on Memotion/MAMI --
+there is usually no text overlay in the image at all, and the tweet text arrives separately
+in the `text` field. The prompts still refer to a "text overlay"; on a photo with none, the
+"if a listed signal is absent, do not invent it" instruction applies and the model describes
+the scene plus its relationship to the tweet.
 
 Output / concurrency
 --------------------
-A run writes ONLY its own per-variant sidecar (`mami_captions_complete.<variant>.json`, a
+A run writes ONLY its own per-variant sidecar (`mmsd_captions_complete.<variant>.json`, a
 flat {img: caption} map) and never the dataset JSON. That is what makes it safe to caption
-several variants at once in two terminals: the previous design loaded the whole dataset JSON
-and rewrote it after every image, so two concurrent runs would each serialize a snapshot
-taken before the other's captions existed and the slower writer would silently erase the
-other's work.
+several variants at once on different GPUs: a design where every run loaded the whole
+dataset JSON and rewrote it after each image would have two concurrent runs each serialize a
+stale snapshot, and the slower writer would erase the other's captions.
 
 Merge the finished sidecars into the dataset JSON in a single pass afterwards with
 `--merge` (run it only when no caption job is active).
 
 Resume behaviour: a run skips images already present in its sidecar or its `.txt` tracker,
-so an interrupted run picks up where it left off. The sidecar is written atomically (temp
-file + rename, one `.bak` kept), so a crash cannot corrupt it.
+so an interrupted run picks up where it left off -- which matters here more than on the
+smaller datasets, since MMSD is 24,635 images. The sidecar is written atomically (temp file
++ rename, one `.bak` kept), so a crash cannot corrupt it.
 
 Requires: `ram_plus_swin_large_14m.pth` and
 `openimages_rare_200_llm_tag_descriptions.json` (repo root), plus RAM/GroundingDINO deps.
 
 Usage:
-    python MAMI/mami_cap_gen.py                        # misogyny prompt (primary)
-    python MAMI/mami_cap_gen.py --prompt all           # unified-prompt ablation
-    python MAMI/mami_cap_gen.py --limit 5              # smoke test
+    python MMSD/mmsd_cap_gen.py                        # sarcasm prompt (primary)
+    python MMSD/mmsd_cap_gen.py --prompt all           # unified-prompt ablation
+    python MMSD/mmsd_cap_gen.py --limit 5              # smoke test
 
     # Two variants at once, one per GPU (run in separate terminals):
-    python MAMI/mami_cap_gen.py --prompt all     --gpu 0
-    python MAMI/mami_cap_gen.py --prompt generic --gpu 1
+    python MMSD/mmsd_cap_gen.py --prompt sarcasm --gpu 0
+    python MMSD/mmsd_cap_gen.py --prompt all     --gpu 1
     # ...then, once both have finished:
-    python MAMI/mami_cap_gen.py --merge
+    python MMSD/mmsd_cap_gen.py --merge
 """
 
 import os
 import sys
 
-# --gpu must take effect BEFORE mami_gpu (and hence torch) is imported, so it is parsed
+# --gpu must take effect BEFORE mmsd_gpu (and hence torch) is imported, so it is parsed
 # straight off sys.argv here rather than in main(). Once CUDA is initialized it is too late
 # to change which devices are visible. argparse still declares --gpu so it shows up in
 # --help and is accepted normally.
@@ -73,7 +83,7 @@ for _i, _arg in enumerate(sys.argv[1:]):
         os.environ["CUDA_VISIBLE_DEVICES"] = _gpu
         break
 
-import mami_gpu  # noqa: E402,F401  (pins CUDA_VISIBLE_DEVICES before torch import)
+import mmsd_gpu  # noqa: E402,F401  (pins CUDA_VISIBLE_DEVICES before torch import)
 
 import argparse  # noqa: E402
 import json  # noqa: E402
@@ -99,7 +109,7 @@ from ram.models import ram_plus
 # ---------------------------------------------------------------------------
 # Config / paths
 # ---------------------------------------------------------------------------
-from mami_common import MAMI_IMAGE_ROOT as MAMI_ROOT, MAMI_DATA_PATH as DEFAULT_JSON
+from mmsd_common import MMSD_IMAGE_ROOT as MMSD_ROOT, MMSD_DATA_PATH as DEFAULT_JSON
 
 # Grounding + captioning model assets (repo-root relative, as in vg_caption_gen.py).
 RAM_PRETRAINED_PATH = "ram_plus_swin_large_14m.pth"
@@ -112,23 +122,23 @@ if torch.cuda.is_available():
     torch.cuda.set_device(device)
 
 # Which JSON field each prompt variant writes, and its resume tracker. The primary
-# 'misogyny' prompt writes the canonical field the training scripts read by default.
+# 'sarcasm' prompt writes the canonical field the training scripts read by default.
 #
-# `shard_path` gives the per-variant sidecar this run writes to. Runs NEVER write the main
-# dataset JSON directly -- that is what makes concurrent runs safe; use `--merge` to fold
-# finished sidecars back into the main JSON.
+# `shard` is the per-variant sidecar this run writes to (see `shard_path`). Runs NEVER write
+# the main dataset JSON directly -- that is what makes concurrent runs safe; use `--merge`
+# to fold finished shards back into the main JSON.
 PROMPT_CONFIG = {
-    "misogyny": {
+    "sarcasm": {
         "field": "ivl_8b_new_caption",
-        "tracker": "processed_mami_misogyny_images.txt",
+        "tracker": "processed_mmsd_internvl_images.txt",
     },
     "all": {
         "field": "ivl_caption_unified",
-        "tracker": "processed_mami_unified_images.txt",
+        "tracker": "processed_mmsd_unified_images.txt",
     },
     "generic": {
         "field": "ivl_caption_generic",
-        "tracker": "processed_mami_generic_images.txt",
+        "tracker": "processed_mmsd_generic_images.txt",
     },
 }
 
@@ -136,14 +146,14 @@ PROMPT_CONFIG = {
 def shard_path(json_path: str, variant: str) -> str:
     """Path of the per-variant caption sidecar for `variant`.
 
-    Concurrency: two cap-gen runs in two terminals would otherwise both load the whole
-    dataset JSON and rewrite it after every image, so each would serialize a snapshot taken
-    before the other's captions existed and the slower writer would silently erase the
-    faster one's work. Giving every variant its own file removes the shared mutable state
-    entirely -- no locking, and a crashed run can never corrupt another variant's captions.
+    Concurrency: two cap-gen runs on two GPUs would otherwise both load the whole dataset
+    JSON and rewrite it after every image, so each would serialize a snapshot taken before
+    the other's captions existed and the slower writer would silently erase the faster
+    one's work. Giving every variant its own file removes the shared mutable state entirely
+    -- no locking, and a crashed run can never corrupt another variant's captions.
 
     The sidecar is a flat {img: caption} map, written next to the dataset JSON as
-    e.g. `mami_captions_complete.misogyny.json`.
+    e.g. `mmsd_captions_complete.sarcasm.json`.
     """
     base, ext = os.path.splitext(json_path)
     return f"{base}.{variant}{ext}"
@@ -185,7 +195,7 @@ def save_shard(path: str, captions: Dict[str, str]) -> None:
 # Prompts
 # ---------------------------------------------------------------------------
 # Verbatim from `prompts.md` at the repo root, which is the single source of truth for
-# prompt wording across datasets. 'misogyny' is the MISOGYNY prompt (the primary for this
+# prompt wording across datasets. 'sarcasm' is the SARCASM prompt (the primary for this
 # dataset), 'all' is the UNIFIED prompt, and 'generic' is the GENERIC prompt -- the latter
 # two exist for the caption-specialization ablation. Every prompt shares the same hard
 # constraints: one caption, no more than 40 words, describe the mechanism rather than
@@ -195,16 +205,16 @@ def save_shard(path: str, captions: Dict[str, str]) -> None:
 # `<image>` placeholder and the grounding info.
 
 _VARIANT_PROMPT = {
-    "misogyny": """Task: Analyze this meme image using the above grounding information and generate a **single caption** suitable for CLIP fine-tuning. Keep the caption to NO MORE THAN 40 words -- it must fit in a 64-token text encoder without being cut off, so be terse and prioritise the mechanism over scene detail.
+    "sarcasm": """Task: Analyze this meme image using the above grounding information and generate a **single caption** suitable for CLIP fine-tuning. Keep the caption to NO MORE THAN 40 words -- it must fit in a 64-token text encoder without being cut off, so be terse and prioritise the mechanism over scene detail.
 
 The caption should:
 - Describe the main visual elements (people, facial expressions, gestures, objects, setting, and their actions)
 - Summarize the text overlay (if short) or explain its meaning concisely
-- If women are depicted or referenced, describe their portrayed role, actions, relationships to other subjects, and any explicit comparisons or stereotypical descriptions expressed by the text or imagery
-- If the image and text together convey a gender-related comparison, insult, stereotype, or objectification, describe how the text and image combine to express it using concrete observations; if not, do not invent one
+- If the text and image create a contrast, contradiction, reversal, exaggeration, or other observable incongruity between what the text claims and what the image shows, describe it explicitly
+- Describe linguistic cues such as hyperbole, rhetorical questions, exaggerated praise, or obvious understatement when they are explicitly present in the text
 - State whether the image reinforces, contradicts, exaggerates, or recontextualizes the text, using only observable evidence
 - Mention recognizable meme templates when identifiable
-- Avoid judgmental labels (e.g., 'misogynistic', 'sexist') — describe the content and mechanism, not a verdict
+- Avoid judgmental labels (e.g., 'sarcastic', 'ironic') - describe the content and mechanism, not a verdict
 
 If a listed signal is absent, do not invent it.
 Do not speculate about intent or meaning beyond what is visibly present.
@@ -221,7 +231,7 @@ The caption should:
 - If the text and image create observable contrast, exaggeration, reversal, incongruity, rhetorical questioning, or wordplay, describe that relationship
 - State whether the image reinforces, contradicts, exaggerates, or recontextualizes the text, using only observable evidence
 - Mention recognizable meme templates when identifiable
-- Avoid judgmental labels (e.g., 'offensive', 'sarcastic', 'misogynistic', 'funny', 'hateful') — describe the content and mechanism, not a verdict
+- Avoid judgmental labels (e.g., 'offensive', 'sarcastic', 'misogynistic', 'funny', 'hateful') - describe the content and mechanism, not a verdict
 
 If a listed signal is absent, do not invent it.
 Do not speculate about intent or meaning beyond what is visibly present.
@@ -236,7 +246,7 @@ The caption should:
 - Summarize the text overlay (if short) or explain its meaning concisely
 - State whether the image reinforces, contradicts, exaggerates, or recontextualizes the text, using only observable evidence
 - Mention recognizable meme templates when identifiable
-- Avoid judgmental labels — describe the content and mechanism, not a verdict
+- Avoid judgmental labels - describe the content and mechanism, not a verdict
 
 If a listed signal is absent, do not invent it.
 Do not speculate about intent or meaning beyond what is visibly present.
@@ -247,7 +257,7 @@ Caption: [Generated caption here]""",
 
 
 def build_prompt(grounding_prompt: str, variant: str) -> str:
-    """Build a MAMI captioning prompt for the given prompt variant.
+    """Build an MMSD captioning prompt for the given prompt variant.
 
     Prepends the RAM++/GroundingDINO grounding block to the variant's prompt from
     `prompts.md`, so the model describes what was actually detected.
@@ -316,17 +326,47 @@ def format_grounding_prompt(grounding_info: Dict[str, List[Tuple]]) -> str:
 
 
 # ---------------------------------------------------------------------------
+# InternVL captioner
+# ---------------------------------------------------------------------------
+def load_internvl():
+    model = (
+        AutoModel.from_pretrained(
+            INTERNVL_MODEL,
+            torch_dtype=torch.bfloat16,
+            low_cpu_mem_usage=True,
+            trust_remote_code=True,
+        )
+        .eval()
+        .to(device)
+    )
+    tokenizer = AutoTokenizer.from_pretrained(INTERNVL_MODEL, trust_remote_code=True, use_fast=False)
+    return model, tokenizer
+
+
+def load_image_internvl(image_path, input_size=448):
+    image = Image.open(image_path).convert("RGB")
+    transform = T.Compose(
+        [
+            T.Resize((input_size, input_size)),
+            T.ToTensor(),
+            T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        ]
+    )
+    return transform(image).unsqueeze(0).to(device)
+
+
+# ---------------------------------------------------------------------------
 # Caption length budget
 # ---------------------------------------------------------------------------
-# The three MAMI backbones cap text at different lengths:
-#   CLIP ViT-L/14            77 tokens  (clip_vitL_14_mami.py)
+# The three MMSD backbones cap text at different lengths:
+#   CLIP ViT-L/14            77 tokens  (clip_vitL_14_mmsd.py)
 #   OpenCLIP XLM-R ViT-H/14  77 tokens  (positional embedding table; a hard limit)
-#   SigLIP2                  64 tokens  (siglip2_mami.py)
+#   SigLIP2                  64 tokens  (siglip2_mmsd.py)
 # Anything longer is silently truncated at train time, and because these prompts put the
-# discriminative part (the portrayed role of women, and how text and image combine) at the
-# END, truncation preferentially destroys the signal and keeps generic scene description.
-# So captions are budgeted to the tightest limit -- SigLIP2's 64 -- and all three backbones
-# then see identical, complete captions.
+# discriminative part (the incongruity between text and image, and the linguistic cues) at
+# the END, truncation preferentially destroys the signal and keeps generic scene
+# description. So captions are budgeted to the tightest limit -- SigLIP2's 64 -- and all
+# three backbones then see identical, complete captions.
 CAPTION_TOKEN_BUDGET = 64
 _LENGTH_TOKENIZER = "google/siglip2-base-patch16-224"
 
@@ -375,36 +415,6 @@ def fit_to_budget(caption: str, budget: int = CAPTION_TOKEN_BUDGET) -> str:
     return " ".join(words).rstrip(",;:")
 
 
-# ---------------------------------------------------------------------------
-# InternVL captioner (primary, GPU)
-# ---------------------------------------------------------------------------
-def load_internvl():
-    model = (
-        AutoModel.from_pretrained(
-            INTERNVL_MODEL,
-            torch_dtype=torch.bfloat16,
-            low_cpu_mem_usage=True,
-            trust_remote_code=True,
-        )
-        .eval()
-        .to(device)
-    )
-    tokenizer = AutoTokenizer.from_pretrained(INTERNVL_MODEL, trust_remote_code=True, use_fast=False)
-    return model, tokenizer
-
-
-def load_image_internvl(image_path, input_size=448):
-    image = Image.open(image_path).convert("RGB")
-    transform = T.Compose(
-        [
-            T.Resize((input_size, input_size)),
-            T.ToTensor(),
-            T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-        ]
-    )
-    return transform(image).unsqueeze(0).to(device)
-
-
 def generate_caption_internvl(image_path: str, grounding_info, model, tokenizer, variant: str) -> str:
     pixel_values = load_image_internvl(image_path).to(torch.bfloat16).to(device)
     prompt = build_prompt(format_grounding_prompt(grounding_info), variant)
@@ -447,8 +457,7 @@ def process(json_path: str, variant: str, limit: int = None, save_every: int = 2
     if limit is not None:
         todo = todo[:limit]
     print(f"[{variant}] {len(todo)} images to caption -> {out_path} (of {len(images)} total)")
-    print(f"[{variant}] GPU: CUDA_VISIBLE_DEVICES="
-          f"{os.environ.get('CUDA_VISIBLE_DEVICES', '<unset>')}")
+    print(f"[{variant}] GPU: CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES', '<unset>')}")
     if not todo:
         return
 
@@ -462,7 +471,7 @@ def process(json_path: str, variant: str, limit: int = None, save_every: int = 2
 
     since_save = 0
     for img_rel in tqdm(todo, desc=f"Captioning ({variant})", unit="image"):
-        image_path = os.path.join(MAMI_ROOT, img_rel)
+        image_path = os.path.join(MMSD_ROOT, img_rel)
         try:
             tags = recognize_tags(image_path, ram_model, transform)
             grounding_info = extract_grounding_info(image_path, tags, gd_processor, gd_model)
@@ -479,7 +488,7 @@ def process(json_path: str, variant: str, limit: int = None, save_every: int = 2
                 f.write(img_rel + "\n")
 
             # Flush periodically rather than after every image: the sidecar is small, but
-            # rewriting it 11,000 times is pure overhead. The tracker above is appended
+            # rewriting it 24,635 times is pure overhead. The tracker above is appended
             # immediately, and re-captioning a few images after a crash is cheap.
             since_save += 1
             if since_save >= save_every:
@@ -492,7 +501,7 @@ def process(json_path: str, variant: str, limit: int = None, save_every: int = 2
     save_shard(out_path, captions)
     print(f"[{variant}] done. {len(captions)} captions in {out_path}")
     print(f"[{variant}] merge into the dataset JSON with: "
-          f"python MAMI/mami_cap_gen.py --merge --prompt {variant}")
+          f"python MMSD/mmsd_cap_gen.py --merge --prompt {variant}")
 
 
 def merge(json_path: str, variants: List[str]) -> None:
@@ -528,12 +537,12 @@ def main():
     parser.add_argument(
         "--prompt",
         choices=list(PROMPT_CONFIG),
-        default="misogyny",
-        help="Which prompt variant to run. 'misogyny' (default) writes the canonical "
+        default="sarcasm",
+        help="Which prompt variant to run. 'sarcasm' (default) writes the canonical "
         "ivl_8b_new_caption the training scripts read; 'all' (unified) and 'generic' write "
         "their own field for a caption-specialization ablation.",
     )
-    parser.add_argument("--json", default=DEFAULT_JSON, help="Path to the MAMI skeleton JSON.")
+    parser.add_argument("--json", default=DEFAULT_JSON, help="Path to the MMSD skeleton JSON.")
     parser.add_argument(
         "--limit",
         type=int,

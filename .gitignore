@@ -2,6 +2,7 @@ __pycache__/
 *.pth
 *.pt
 
+*.bak
 *.txt
 *.json
 *.jsonl
