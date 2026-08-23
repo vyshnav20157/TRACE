@@ -3,7 +3,7 @@ Memotion caption generation: RAM++ tags -> GroundingDINO boxes -> InternVL capti
 
 This mirrors `MAMI/mami_cap_gen.py` but is driven by the Memotion skeleton JSON produced by
 `Memotion/build_memotion_skeleton.py`. Gemini has been dropped from this flow: only
-InternVL runs, on the local GPU, backfilling `ivl_8b_new_caption`. No API key is required.
+InternVL runs, on the local GPU, backfilling `ivl_caption_unified`. No API key is required.
 
 Prompts
 -------
@@ -15,8 +15,13 @@ the three tasks comparable (identical inputs, only the label changes).
 
 Per-task prompts are also available (`--prompt humour|offensive|sarcasm`) for a
 task-specialized caption ablation; each writes to its OWN field
-(`ivl_caption_humour`, ...) so it never clobbers the shared caption, and training can pick
-it up via `--caption-field`.
+(`ivl_caption_humour`, ...) so it never clobbers the shared caption. These are what the
+modality ablation's `image_taskcap` arm reads (see `Memotion/memotion_modality.py`).
+
+`--prompt generic` is the fifth variant: a plain descriptive prompt with NO task cues at all,
+written to `ivl_caption_generic`. It is the `image_genericcap` arm of the modality ablation,
+and is deliberately NOT the same as `--prompt all` -- 'all' is the union of every task's cues,
+which makes it more task-loaded than any single task prompt, not less.
 
 Prompt wording is verbatim from `prompts.md` at the repo root, which is the single source
 of truth -- keep the two in sync when either changes. The 40-word cap in each prompt is
@@ -48,6 +53,7 @@ Requires: `ram_plus_swin_large_14m.pth` and
 Usage:
     python Memotion/memotion_cap_gen.py                      # unified caption, all tasks
     python Memotion/memotion_cap_gen.py --prompt humour      # humour-specialized ablation
+    python Memotion/memotion_cap_gen.py --prompt generic     # generic caption (modality arm 4)
     python Memotion/memotion_cap_gen.py --limit 5            # smoke test
 
     # Two tasks at once, one per GPU (run in separate terminals):
@@ -84,7 +90,12 @@ from typing import Dict, List, Tuple  # noqa: E402
 import pandas as pd
 import torch
 import torchvision.transforms as T
-from PIL import Image
+from PIL import Image, ImageFile
+
+# One Memotion train image (got_GOT-Meme-9.png) is missing its trailing PNG chunk;
+# the pixel data decodes fine apart from the last few rows, so tolerate it rather
+# than dropping the sample.
+ImageFile.LOAD_TRUNCATED_IMAGES = True
 from tqdm import tqdm
 from transformers import (
     AutoModel,
@@ -120,7 +131,7 @@ if torch.cuda.is_available():
 # `--merge` to fold finished shards back into the main JSON.
 PROMPT_CONFIG = {
     "all": {
-        "field": "ivl_8b_new_caption",
+        "field": "ivl_caption_unified",
         "tracker": "processed_memotion_internvl_images.txt",
     },
     "humour": {
@@ -134,6 +145,14 @@ PROMPT_CONFIG = {
     "sarcasm": {
         "field": "ivl_caption_sarcasm",
         "tracker": "processed_memotion_sarcasm_images.txt",
+    },
+    # The GENERIC prompt: plain description with no task cues at all. This is the
+    # `image_genericcap` arm of the modality ablation (Memotion/memotion_modality.py) and is
+    # NOT the same thing as 'all' -- 'all' is the union of every task's cues, which makes it
+    # more task-loaded than any single task prompt, not less.
+    "generic": {
+        "field": "ivl_caption_generic",
+        "tracker": "processed_memotion_generic_images.txt",
     },
 }
 
@@ -259,6 +278,21 @@ The caption should:
 - State whether the image reinforces, contradicts, exaggerates, or recontextualizes the text, using only observable evidence
 - Mention recognizable meme templates when identifiable
 - Avoid judgmental labels (e.g., 'sarcastic', 'ironic') - describe the content and mechanism, not a verdict
+
+If a listed signal is absent, do not invent it.
+Do not speculate about intent or meaning beyond what is visibly present.
+
+Format the response as:
+Caption: [Generated caption here]""",
+
+    "generic": """Task: Analyze this meme image using the above grounding information and generate a **single caption** suitable for CLIP fine-tuning. Keep the caption to NO MORE THAN 40 words -- it must fit in a 64-token text encoder without being cut off, so be terse and prioritise the mechanism over scene detail.
+
+The caption should:
+- Describe the main visual elements (people, facial expressions, gestures, objects, setting, and their actions)
+- Summarize the text overlay (if short) or explain its meaning concisely
+- State whether the image reinforces, contradicts, exaggerates, or recontextualizes the text, using only observable evidence
+- Mention recognizable meme templates when identifiable
+- Avoid judgmental labels - describe the content and mechanism, not a verdict
 
 If a listed signal is absent, do not invent it.
 Do not speculate about intent or meaning beyond what is visibly present.
@@ -552,8 +586,9 @@ def main():
         choices=list(PROMPT_CONFIG),
         default="all",
         help="Which prompt variant to run. 'all' (default) writes the shared "
-        "ivl_8b_new_caption used by every task; the per-task variants write their own "
-        "field for a task-specialized caption ablation.",
+        "ivl_caption_unified used by every task; the per-task variants write their own "
+        "field for a task-specialized caption ablation; 'generic' writes ivl_caption_generic "
+        "(plain description, no task cues) for the modality ablation's image_genericcap arm.",
     )
     parser.add_argument("--json", default=DEFAULT_JSON, help="Path to the Memotion skeleton JSON.")
     parser.add_argument(

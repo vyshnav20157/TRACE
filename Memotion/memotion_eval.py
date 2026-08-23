@@ -15,6 +15,16 @@ with the FHM/MultiOFF/MAMI results elsewhere in this repo.
     python Memotion/memotion_eval.py --task offensive --backbone vitl14 \
         --checkpoint checkpoints/memotion_offensive_vitl14_best_model.pth
 
+For the modality-ablation arms (roberta only), pass the `--arm` the checkpoint was TRAINED
+with; the checkpoint path is then inferred from task+backbone+arm and `--checkpoint` can be
+omitted:
+
+    python Memotion/memotion_eval.py --task humour --arm image_only
+    python Memotion/memotion_eval.py --task offensive --arm image_taskcap
+
+`--arm` must match training: it decides the text stream the model is fed, so evaluating an
+`image_only` checkpoint under `--arm trace` scores it on inputs it never saw.
+
 Checkpoints are the ones written by the training scripts (a dict with 'model_state_dict').
 """
 
@@ -37,6 +47,23 @@ from memotion_common import (
     split_memotion_data,
 )
 from memotion_metrics import format_metrics
+from memotion_modality import (
+    ARMS,
+    DEFAULT_ARM,
+    arm_sources,
+    check_override,
+    checkpoint_name,
+    describe_arm,
+    loss_config_for,
+)
+
+# Imported from utils directly rather than through the backbone module: only the roberta
+# scripts re-export these, and eval also dispatches to vitl14/siglip2.
+from utils.caption_selection import (
+    format_selection_distribution,
+    select_best_captions,
+    selection_distribution,
+)
 
 BACKBONES = {
     "roberta": "clip_xlm_roberta_memotion",
@@ -45,11 +72,17 @@ BACKBONES = {
 }
 
 
-def build_eval_dataset(mod, backbone, eval_data, caption_field):
-    """Instantiate the backbone's MemeDatasetJSON for the evaluation split."""
+def build_eval_dataset(mod, backbone, eval_data, caption_field, sources):
+    """Instantiate the backbone's MemeDatasetJSON for the evaluation split.
+
+    `sources` is the modality arm's text-source list and must match the one training used --
+    evaluating an `image_only` checkpoint against the full TRACE caption list would feed the
+    model inputs it never saw. Only roberta accepts it; the secondary backbones predate the
+    ablation study and are always evaluated on their original [text, caption] list.
+    """
     if backbone == "roberta":
-        # roberta's dataset takes (df, preprocess_fn, tokenizer, caption_field).
-        return mod.MemeDatasetJSON(eval_data, mod.preprocess, mod.tokenizer, caption_field)
+        # roberta's dataset takes (df, preprocess_fn, tokenizer, caption_field, sources).
+        return mod.MemeDatasetJSON(eval_data, mod.preprocess, mod.tokenizer, caption_field, sources)
     if backbone == "vitl14":
         return mod.MemeDatasetJSON(eval_data, mod.clip_processor, caption_field)
     # siglip2
@@ -66,10 +99,7 @@ def build_model(mod, backbone):
 
 
 def run_eval(mod, backbone, model, dataloader, device, loss_config):
-    """Call the backbone's evaluate_model with its own signature."""
-    if backbone == "roberta":
-        # roberta's evaluate_model takes no loss_config argument.
-        return mod.evaluate_model(model, [dataloader], device)
+    """Call the backbone's evaluate_model. All three now take the same signature."""
     return mod.evaluate_model(model, [dataloader], device, loss_config)
 
 
@@ -78,10 +108,19 @@ def main():
     parser.add_argument("--task", choices=TASK_ORDER, default="humour",
                         help="Which Memotion Task B binary problem to evaluate (default: humour).")
     parser.add_argument("--backbone", choices=list(BACKBONES), default="roberta")
-    parser.add_argument("--checkpoint", required=True, help="Path to a trained checkpoint (.pth).")
+    parser.add_argument("--checkpoint", default=None,
+                        help="Path to a trained checkpoint (.pth). Defaults to the checkpoint "
+                             "the given --task/--backbone/--arm combination writes.")
     parser.add_argument("--data-path", dest="data_path", default=MEMOTION_DATA_PATH)
-    parser.add_argument("--caption-field", dest="caption_field", default="ivl_8b_new_caption",
-                        help="JSON field holding the generated caption. Must match training.")
+    parser.add_argument("--arm", choices=list(ARMS), default=DEFAULT_ARM,
+                        help="Modality ablation arm the checkpoint was TRAINED with (default: "
+                             "trace). Must match training, or the model is fed inputs it never "
+                             "saw. Roberta only.")
+    parser.add_argument("--caption-field", dest="caption_field_override", default=None,
+                        help="Override the JSON caption field the arm reads. For the "
+                             "task/generic/unified prompt comparison use the dedicated arms "
+                             "(image_taskcap / image_genericcap / image_unifiedcap) instead. "
+                             "Must match training.")
     parser.add_argument("--split", default="test", choices=["train", "val", "test"],
                         help="Which split to evaluate (default: test).")
     parser.add_argument("--batch-size", type=int, default=64)
@@ -90,11 +129,35 @@ def main():
                         help="Append metrics here as JSON lines (default: Memotion/evalresults.jsonl).")
     args = parser.parse_args()
 
+    if args.arm != DEFAULT_ARM and args.backbone != "roberta":
+        raise SystemExit(
+            f"--arm {args.arm} is implemented for --backbone roberta only "
+            f"(got '{args.backbone}')."
+        )
+
+    # Same guard as training: the checkpoint is chosen by (task, arm) alone, so a mismatched
+    # --caption-field would score one arm's model against another prompt's captions.
+    check_override(args.arm, args.task, args.caption_field_override)
+
     module_name = BACKBONES[args.backbone]
     print(f"[memotion_eval] backbone={args.backbone} -> {module_name}")
     print(f"[memotion_eval] task={describe_task(args.task)}")
+    print(f"[memotion_eval] arm={describe_arm(args.arm, args.task, args.caption_field_override)}")
     mod = importlib.import_module(module_name)
     device = mod.device
+
+    checkpoint_path = args.checkpoint or os.path.join(
+        "checkpoints", checkpoint_name(args.task, args.backbone, args.arm)
+    )
+    if not os.path.exists(checkpoint_path):
+        raise SystemExit(f"Checkpoint not found: {checkpoint_path}")
+
+    sources = arm_sources(args.arm, args.task, args.caption_field_override)
+    # The secondary backbones ignore `sources` and read [text, caption_field] as before, so
+    # they still need a concrete field: the arm's caption slot, or the legacy default.
+    caption_field = args.caption_field_override or next(
+        (s for s in sources if s not in ("text", "null")), mod.CAPTION_FIELD
+    )
 
     data = pd.read_json(args.data_path)
     data = apply_task_labels(data, args.task)
@@ -102,16 +165,21 @@ def main():
     eval_df = splits[args.split]
     print(f"Evaluating on '{args.split}' split ({len(eval_df)} rows)")
 
-    dataset = build_eval_dataset(mod, args.backbone, eval_df, args.caption_field)
+    dataset = build_eval_dataset(mod, args.backbone, eval_df, caption_field, sources)
     dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False, collate_fn=mod.collate_fn)
 
     model = build_model(mod, args.backbone).to(device)
 
-    checkpoint = torch.load(args.checkpoint, map_location=device)
+    checkpoint = torch.load(checkpoint_path, map_location=device)
     if isinstance(checkpoint, dict) and checkpoint.get("task") not in (None, args.task):
         print(
             f"WARNING: checkpoint was trained on task '{checkpoint['task']}' but you asked "
             f"for '{args.task}'. Metrics below will be meaningless."
+        )
+    if isinstance(checkpoint, dict) and checkpoint.get("arm") not in (None, args.arm):
+        print(
+            f"WARNING: checkpoint was trained on arm '{checkpoint['arm']}' but you asked for "
+            f"'{args.arm}'. The model is being fed inputs it never saw."
         )
     state_dict = checkpoint["model_state_dict"] if "model_state_dict" in checkpoint else checkpoint
     # Training may have saved under DataParallel ('module.' prefix); strip it.
@@ -123,10 +191,20 @@ def main():
         print(f"Warning: {len(unexpected)} unexpected keys when loading checkpoint.")
     model.eval()
 
-    # Match the training scripts: select best captions on the eval set before scoring.
-    loss_config = {"classification": True, "contrastive": False, "relevance": True}
-    best_captions = mod.select_best_captions(model, dataset, device, loss_config)
-    dataset.best_captions = best_captions
+    # Match the training scripts: select best captions on the eval set before scoring, and
+    # only when the arm actually has multiple candidates to choose between.
+    loss_config = loss_config_for(args.arm)
+    caption_choices = None
+    if len(sources) > 1:
+        dataset.best_captions, caption_choices = select_best_captions(
+            model, dataset, device, loss_config, return_choices=True
+        )
+        # Same discrimination check as training: report which source the scorer picked.
+        print(format_selection_distribution(
+            caption_choices, sources, title=f"{args.split.capitalize()} caption selection"
+        ))
+    else:
+        print(f"Skipping caption selection (arm '{args.arm}' has a single text source).")
 
     result = run_eval(mod, args.backbone, model, dataloader, device, loss_config)
     metrics = result[0] if isinstance(result, tuple) else result
@@ -137,8 +215,15 @@ def main():
         record = {
             "task": args.task,
             "backbone": args.backbone,
-            "checkpoint": args.checkpoint,
+            "arm": args.arm,
+            "text_sources": sources,
+            "checkpoint": checkpoint_path,
             "split": args.split,
+            "caption_selection": (
+                {src: [n, frac] for src, (n, frac) in
+                 selection_distribution(caption_choices, sources).items()}
+                if caption_choices else None
+            ),
             "metrics": {k: float(v) for k, v in metrics.items()},
         }
         with open(args.log_file, "a") as f:

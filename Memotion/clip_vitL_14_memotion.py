@@ -7,7 +7,12 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
-from PIL import Image
+from PIL import Image, ImageFile
+
+# One Memotion train image (got_GOT-Meme-9.png) is missing its trailing PNG chunk;
+# the pixel data decodes fine apart from the last few rows, so tolerate it rather
+# than dropping the sample.
+ImageFile.LOAD_TRUNCATED_IMAGES = True
 from tqdm import tqdm
 from transformers import CLIPProcessor, CLIPModel
 import numpy as np
@@ -45,7 +50,7 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 clip_processor = CLIPProcessor.from_pretrained("openai/clip-vit-large-patch14")
 
 # Caption field the dataset reads alongside the meme's own text.
-CAPTION_FIELD = "ivl_8b_new_caption"
+CAPTION_FIELD = "ivl_caption_unified"
 
 
 class MemeDatasetJSON(Dataset):
@@ -635,7 +640,7 @@ def parse_args():
     parser.add_argument('--data-path', dest='data_path', default=MEMOTION_DATA_PATH,
                         help="Memotion dataset JSON (records orient) from build_memotion_skeleton.py.")
     parser.add_argument('--caption-field', dest='caption_field', default=CAPTION_FIELD,
-                        help="JSON field holding the generated caption (default: ivl_8b_new_caption).")
+                        help="JSON field holding the generated caption (default: ivl_caption_unified).")
     parser.add_argument('--epochs', type=int, default=30)
     parser.add_argument('--subset', type=int, default=None,
                         help="Train on N sampled train rows (val/test scaled down) for smoke tests.")

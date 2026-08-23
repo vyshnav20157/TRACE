@@ -25,6 +25,15 @@ from mmsd_common import (
     split_mmsd_data,
 )
 from mmsd_metrics import SELECTION_METRIC, compute_metrics, format_metrics, wandb_metrics
+from mmsd_modality import (
+    ARMS,
+    DEFAULT_ARM,
+    build_captions,
+    checkpoint_name,
+    loss_config_for,
+    preds_name,
+    resolve_arm,
+)
 
 # Import the modules
 from utils.caption_selection import select_best_captions
@@ -78,14 +87,18 @@ class _SigLIP2Processor:
 siglip_processor = _SigLIP2Processor()
 
 # Caption field the dataset reads alongside the tweet's own text.
-CAPTION_FIELD = "ivl_8b_new_caption"
+CAPTION_FIELD = "ivl_caption_task"
 
 
 class MemeDatasetJSON(Dataset):
-    def __init__(self, dataframe, processor, caption_field=CAPTION_FIELD):
+    def __init__(self, dataframe, processor, caption_field=CAPTION_FIELD, sources=None):
         self.data = dataframe.to_dict(orient='records')
         self.processor = processor
         self.caption_field = caption_field
+        # `sources` is the modality-ablation arm's ordered text-source list (see
+        # mmsd_modality.py). The default reproduces the original TRACE behaviour exactly:
+        # [tweet text, ivl caption] -- or just the tweet text before captioning has run.
+        self.sources = sources if sources is not None else ['text', caption_field]
         self.images = {}
         self.captions = defaultdict(list)
         self.best_captions = {}
@@ -97,20 +110,11 @@ class MemeDatasetJSON(Dataset):
                 image = Image.open(image_path).convert('RGB')
                 self.images[image_id] = image
 
-                # MMSD uses a single generated caption (InternVL); Gemini is not part of this
-                # flow, so captions are [tweet text, ivl caption] -- or just the tweet text
-                # before captioning has run.
-                captions = [
-                    str(row.get('text', 'No caption')),
-                    str(row.get(self.caption_field, 'No caption'))
-                ]
-                captions = [cap for cap in captions if cap.strip() and cap.strip().lower() != 'nan']
-                # A tweet whose text is empty would, before captioning has run, leave the caption
-                # list empty and make the processor fail on []. Keep the sample (dropping it
-                # would silently alter the official test split) and fall back to a placeholder.
-                if not captions:
-                    captions = ['No caption']
-                self.captions[image_id] = captions
+                # A tweet whose text is empty would, before captioning has run, leave the
+                # caption list empty and make the processor fail on []. build_captions keeps
+                # the sample (dropping it would silently alter the official test split) and
+                # falls back to a placeholder.
+                self.captions[image_id] = build_captions(row, self.sources)
             else:
                 print(f"Image file {image_path} not found.")
 
@@ -471,6 +475,8 @@ def main(args=None):
     # MMSD is a single binary task, so the skeleton already writes the generic `label`
     # column the shared TRACE machinery reads -- no per-task projection is needed.
 
+    sources = resolve_arm(args, data, args.data_path)
+
     train_data, val_data, test_data = split_mmsd_data(data)
     if args.subset:
         train_data = train_data.sample(n=min(args.subset, len(train_data)), random_state=42)
@@ -479,9 +485,10 @@ def main(args=None):
 
     print(f"Splits -> train {len(train_data)} | val {len(val_data)} | test {len(test_data)}")
 
-    train_dataset = MemeDatasetJSON(train_data, siglip_processor, args.caption_field)
-    val_datasets = [MemeDatasetJSON(val_data, siglip_processor, args.caption_field)]
-    test_dataset = MemeDatasetJSON(test_data, siglip_processor, args.caption_field)
+    caption_field = args.caption_field_override or CAPTION_FIELD
+    train_dataset = MemeDatasetJSON(train_data, siglip_processor, caption_field, sources)
+    val_datasets = [MemeDatasetJSON(val_data, siglip_processor, caption_field, sources)]
+    test_dataset = MemeDatasetJSON(test_data, siglip_processor, caption_field, sources)
 
     # Enable memory efficient attention
     os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'max_split_size_mb:512'
@@ -499,13 +506,15 @@ def main(args=None):
     if args.wandb:
         wandb.init(
             project="mmsd-classification",
-            name="siglip2",
+            name=f"siglip2-{args.arm}",
             config={
                 "learning_rate": learning_rate,
                 "architecture": "SigLIP2-L/16-384 with GS and CS",
                 "dataset": "MMSD2.0",
                 "epochs": num_epochs,
                 "batch_size": actual_batch_size,
+                "arm": args.arm,
+                "text_sources": sources,
             },
         )
 
@@ -547,7 +556,7 @@ def main(args=None):
 
     checkpoint_dir = 'checkpoints'
     os.makedirs(checkpoint_dir, exist_ok=True)
-    checkpoint_path = os.path.join(checkpoint_dir, 'mmsd_siglip2_best_model.pth')
+    checkpoint_path = os.path.join(checkpoint_dir, checkpoint_name('siglip2', args.arm))
 
     start_epoch = 0
     # Model selection follows the OFFICIAL MMSD metric (sarcastic-class F1 @ 0.5), not AUROC.
@@ -584,12 +593,10 @@ def main(args=None):
     best_epoch = start_epoch
     best_model_state = copy.deepcopy(model.state_dict())
 
-    # Define loss configuration for ablation experiments
-    loss_config = {
-        'classification': True,  # Always enabled
-        'contrastive': False,      # Set to False to disable contrastive loss
-        'relevance': True        # Enable relevance loss
-    }
+    # Loss configuration comes from the modality arm: relevance (and hence caption-scorer
+    # training) is on only for the full-TRACE arm, where there are multiple candidate
+    # captions to rank. See mmsd_modality.py for why the single-caption arms turn it off.
+    loss_config = loss_config_for(args.arm)
 
     print(f"\nLoss configuration: {loss_config}")
 
@@ -666,9 +673,17 @@ def main(args=None):
     print(f"Training completed. Using model from epoch {best_epoch}")
     model.load_state_dict(best_model_state)
 
-    # Dynamic Caption Selection for Test Set using the final model
-    print("Selecting best captions for Test Set with the final model...")
-    select_best_captions(model, test_dataset, device, loss_config, batch_size=512)
+    # Dynamic Caption Selection for Test Set using the final model. Only meaningful when
+    # there is more than one candidate caption to choose between -- the single-caption
+    # ablation arms have nothing to select, so the pass is skipped rather than run as an
+    # expensive no-op.
+    if len(sources) > 1:
+        print("Selecting best captions for Test Set with the final model...")
+        test_dataset.best_captions = select_best_captions(
+            model, test_dataset, device, loss_config, batch_size=512
+        )
+    else:
+        print(f"Skipping caption selection (arm '{args.arm}' has a single text source).")
 
     # Evaluate on test set
     print("Evaluating on Test Set...")
@@ -682,11 +697,13 @@ def main(args=None):
     # Save all predictions and labels for test set
     test_results = {
         'backbone': 'siglip2',
+        'arm': args.arm,
+        'text_sources': sources,
         'metrics': test_metrics,
         'predictions': [int(pred) for pred in test_preds],
         'labels': [int(label) for label in test_labels],
     }
-    preds_path = 'mmsd_siglip2_preds.json'
+    preds_path = preds_name('siglip2', args.arm)
     with open(preds_path, 'w') as f:
         json.dump(test_results, f, indent=4)
     print(f"Wrote predictions -> {preds_path}")
@@ -696,8 +713,15 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Train SigLIP2 (TRACE) on MMSD2.0.")
     parser.add_argument('--data-path', dest='data_path', default=MMSD_DATA_PATH,
                         help="MMSD dataset JSON (records orient) from build_mmsd_skeleton.py.")
-    parser.add_argument('--caption-field', dest='caption_field', default=CAPTION_FIELD,
-                        help="JSON field holding the generated caption (default: ivl_8b_new_caption).")
+    parser.add_argument('--arm', choices=list(ARMS), default=DEFAULT_ARM,
+                        help="Modality ablation arm (default: trace, the unmodified architecture). "
+                             "See MMSD/mmsd_modality.py.")
+    parser.add_argument('--caption-field', dest='caption_field_override', default=None,
+                        help="Override the JSON caption field this arm reads (default: the arm's "
+                             "own field). For the task/generic/unified prompt comparison use the "
+                             "dedicated arms (image_taskcap / image_genericcap / "
+                             "image_unifiedcap); this flag is for caption sets that have no arm "
+                             "of their own.")
     parser.add_argument('--epochs', type=int, default=30)
     parser.add_argument('--subset', type=int, default=None,
                         help="Train on N sampled train rows (val/test scaled down) for smoke tests.")

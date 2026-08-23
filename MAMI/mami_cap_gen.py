@@ -119,7 +119,7 @@ if torch.cuda.is_available():
 # finished sidecars back into the main JSON.
 PROMPT_CONFIG = {
     "misogyny": {
-        "field": "ivl_8b_new_caption",
+        "field": "ivl_caption_task",
         "tracker": "processed_mami_misogyny_images.txt",
     },
     "all": {
@@ -530,7 +530,7 @@ def main():
         choices=list(PROMPT_CONFIG),
         default="misogyny",
         help="Which prompt variant to run. 'misogyny' (default) writes the canonical "
-        "ivl_8b_new_caption the training scripts read; 'all' (unified) and 'generic' write "
+        "ivl_caption_task the training scripts read; 'all' (unified) and 'generic' write "
         "their own field for a caption-specialization ablation.",
     )
     parser.add_argument("--json", default=DEFAULT_JSON, help="Path to the MAMI skeleton JSON.")

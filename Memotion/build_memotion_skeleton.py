@@ -5,7 +5,7 @@ This mirrors `utils/build_fhm_skeleton.py` and `MAMI/build_mami_skeleton.py`, bu
 Memotion 1.0 (SemEval-2020 Task 8). The captioning script (`Memotion/memotion_cap_gen.py`)
 and the training scripts both read a single JSON (records orient) with the columns:
 
-    img, text, humour_label, sarcasm_label, offensive_label, split, ivl_8b_new_caption
+    img, text, humour_label, sarcasm_label, offensive_label, split, ivl_caption_unified
 
 Unlike FHM/MAMI there is no single `label` column in the JSON: Memotion Task B is three
 independent binary problems over the same memes, so all three labels are stored and the
@@ -70,7 +70,7 @@ SPLIT_SUBFOLDER = {
 
 # Caption fields the downstream scripts read. Start empty; backfilled by the pipeline.
 # Only InternVL is used (Gemini was dropped from the Memotion flow).
-CAPTION_FIELDS = ["ivl_8b_new_caption"]
+CAPTION_FIELDS = ["ivl_caption_unified"]
 
 # Carried through for reference but never trained on.
 EXTRA_FIELDS = [
@@ -246,7 +246,7 @@ def main():
     data.to_json(args.output, orient="records", indent=2)
     print(f"\nWrote skeleton JSON -> {args.output}")
     print(
-        "Caption field (ivl_8b_new_caption) is empty and ready to backfill via "
+        "Caption field (ivl_caption_unified) is empty and ready to backfill via "
         "Memotion/memotion_cap_gen.py."
     )
 

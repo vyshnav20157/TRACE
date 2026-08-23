@@ -44,7 +44,7 @@ clip_processor = CLIPProcessor.from_pretrained("openai/clip-vit-large-patch14")
 # Caption field the dataset reads alongside the meme's own OCR text. The misogyny prompt
 # (the primary) writes this field; the --caption-field flag points training at the unified
 # or generic caption sets instead, for the caption-specialization ablation.
-CAPTION_FIELD = "ivl_8b_new_caption"
+CAPTION_FIELD = "ivl_caption_task"
 
 
 class MemeDatasetJSON(Dataset):
@@ -649,8 +649,8 @@ def parse_args():
     parser.add_argument('--no-resume', dest='no_resume', action='store_true',
                         help="Ignore an existing checkpoint and start training from scratch.")
     parser.add_argument('--caption-field', dest='caption_field', default=CAPTION_FIELD,
-                        help="JSON field holding the generated caption (default: ivl_8b_new_caption). "
-                             "Use ivl_caption_unified / ivl_caption_generic for the prompt ablation.")
+                        help="JSON field holding the generated caption (default: ivl_caption_task). "
+                             "For the prompt ablation use the dedicated arms on the roberta backbone.")
     return parser.parse_args()
 
 

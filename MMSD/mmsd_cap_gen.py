@@ -3,7 +3,7 @@ MMSD2.0 caption generation: RAM++ tags -> GroundingDINO boxes -> InternVL captio
 
 This mirrors `Memotion/memotion_cap_gen.py` but is driven by the MMSD skeleton JSON produced
 by `MMSD/build_mmsd_skeleton.py`. As with Memotion, Gemini is not part of this flow: only
-InternVL runs, on the local GPU, backfilling `ivl_8b_new_caption`. No API key is required.
+InternVL runs, on the local GPU, backfilling `ivl_caption_task`. No API key is required.
 
 Prompts
 -------
@@ -129,7 +129,7 @@ if torch.cuda.is_available():
 # to fold finished shards back into the main JSON.
 PROMPT_CONFIG = {
     "sarcasm": {
-        "field": "ivl_8b_new_caption",
+        "field": "ivl_caption_task",
         "tracker": "processed_mmsd_internvl_images.txt",
     },
     "all": {
@@ -539,7 +539,7 @@ def main():
         choices=list(PROMPT_CONFIG),
         default="sarcasm",
         help="Which prompt variant to run. 'sarcasm' (default) writes the canonical "
-        "ivl_8b_new_caption the training scripts read; 'all' (unified) and 'generic' write "
+        "ivl_caption_task the training scripts read; 'all' (unified) and 'generic' write "
         "their own field for a caption-specialization ablation.",
     )
     parser.add_argument("--json", default=DEFAULT_JSON, help="Path to the MMSD skeleton JSON.")

@@ -23,9 +23,22 @@ import argparse
 # MAMI shared config (also puts the repo root on sys.path for the utils imports below).
 from mami_common import MAMI_IMAGE_ROOT, MAMI_DATA_PATH, split_mami_data
 from mami_metrics import SELECTION_METRIC, compute_metrics, format_metrics, wandb_metrics
+from mami_modality import (
+    ARMS,
+    DEFAULT_ARM,
+    build_captions,
+    checkpoint_name,
+    loss_config_for,
+    preds_name,
+    resolve_arm,
+)
 
 # Import the modules
-from utils.caption_selection import select_best_captions
+from utils.caption_selection import (
+    format_selection_distribution,
+    select_best_captions,
+    selection_distribution,
+)
 from utils.loss_functions import calculate_loss_gs, FocalLoss
 
 # Set seed for reproducibility
@@ -47,18 +60,23 @@ model, _, preprocess = open_clip.create_model_and_transforms(model_name, pretrai
 tokenizer = open_clip.get_tokenizer(model_name)
 hf_tokenizer = tokenizer.tokenizer
 
-# Caption field the dataset reads alongside the meme's own OCR text. The misogyny prompt
-# (the primary) writes this field; the --caption-field flag points training at the unified
-# or generic caption sets instead, for the caption-specialization ablation.
-CAPTION_FIELD = "ivl_8b_new_caption"
+# Legacy default caption field, kept only as the fallback for callers that construct
+# MemeDatasetJSON without an explicit `sources` list. Which caption an actual run reads is
+# decided by the modality arm (see mami_modality.py): the task arms resolve to the misogyny
+# prompt's `ivl_caption_task`, and --caption-field overrides that.
+CAPTION_FIELD = "ivl_caption_task"
 
 
 class MemeDatasetJSON(Dataset):
-    def __init__(self, dataframe, preprocess_fn, tokenizer, caption_field=CAPTION_FIELD):
+    def __init__(self, dataframe, preprocess_fn, tokenizer, caption_field=CAPTION_FIELD, sources=None):
         self.data = dataframe.to_dict(orient='records')
         self.preprocess = preprocess_fn
         self.tokenizer = tokenizer
         self.caption_field = caption_field
+        # `sources` is the modality-ablation arm's ordered text-source list (see
+        # mami_modality.py). The default reproduces the original TRACE behaviour exactly:
+        # [meme OCR text, ivl caption] -- or just the meme text before captioning has run.
+        self.sources = sources if sources is not None else ['text', caption_field]
         self.images = {}
         self.captions = defaultdict(list)
         self.best_captions = {}
@@ -70,18 +88,11 @@ class MemeDatasetJSON(Dataset):
                 image = Image.open(image_path).convert('RGB')
                 self.images[image_id] = image
 
-                captions = [
-                    str(row.get('text', 'No caption')),
-                    str(row.get(self.caption_field, 'No caption'))
-                ]
-                captions = [cap for cap in captions
-                            if cap.strip() and cap.strip().lower() not in ('nan', 'none')]
-                if not captions:
-                    # A meme with neither usable OCR text nor a caption would otherwise
-                    # hand the tokenizer an empty list and raise IndexError. Keep the
-                    # sample (dropping it would silently alter the official split).
-                    captions = ['No caption']
-                self.captions[image_id] = captions
+                # A meme with neither usable OCR text nor a caption would otherwise hand the
+                # tokenizer an empty list and raise IndexError. build_captions keeps the
+                # sample (dropping it would silently alter the official split) and falls
+                # back to a neutral placeholder.
+                self.captions[image_id] = build_captions(row, self.sources)
             else:
                 print(f"Image file {image_path} not found.")
     
@@ -328,22 +339,29 @@ def collate_fn(batch):
         'label': torch.stack([item['label'] for item in batch])  # Added label
     }
 
-def evaluate_model(model, dataloaders, device):
+def evaluate_model(model, dataloaders, device, loss_config=None):
+    """Evaluate and return MAMI-official (macro-F1 @0.5) + TRACE-style metrics.
+
+    `loss_config` must match the one training used, so the modality-ablation arms score
+    through the same path they were trained on. It defaults to the full-TRACE configuration,
+    which is what the pre-ablation callers expect.
+    """
     model.eval()
     all_preds = []
     all_labels = []
     all_probs = []
-    
+
     # Initialize Focal Loss for validation loss calculation
     criterion = FocalLoss(alpha=0.25, gamma=2.0)
     total_loss = 0
     total_samples = 0
 
-    loss_config = {
-        'classification': True,  # Always enabled
-        'contrastive': False,     # Set to False to disable contrastive loss
-        'relevance': True        # Set to False to disable relevance loss
-    }
+    if loss_config is None:
+        loss_config = {
+            'classification': True,  # Always enabled
+            'contrastive': False,     # Set to False to disable contrastive loss
+            'relevance': True        # Set to False to disable relevance loss
+        }
 
     with torch.no_grad():
         for dataloader in dataloaders:
@@ -386,6 +404,8 @@ def main(args=None):
     data_path = args.data_path
     data = pd.read_json(data_path)
 
+    sources = resolve_arm(args, data, data_path)
+
     # MAMI uses plain train/val/test splits (no FHM seen/unseen scheme).
     train_data, val_data, test_data = split_mami_data(data)
     if args.subset:
@@ -395,9 +415,10 @@ def main(args=None):
 
     # Make dataset accessible globally for logging
     global dataset
-    dataset = MemeDatasetJSON(train_data, preprocess, tokenizer, args.caption_field)
-    val_datasets = [MemeDatasetJSON(val_data, preprocess, tokenizer, args.caption_field)]
-    test_dataset = MemeDatasetJSON(test_data, preprocess, tokenizer, args.caption_field)
+    caption_field = args.caption_field_override or CAPTION_FIELD
+    dataset = MemeDatasetJSON(train_data, preprocess, tokenizer, caption_field, sources)
+    val_datasets = [MemeDatasetJSON(val_data, preprocess, tokenizer, caption_field, sources)]
+    test_dataset = MemeDatasetJSON(test_data, preprocess, tokenizer, caption_field, sources)
 
     # Define actual batch size and gradient accumulation steps
     actual_batch_size = 64
@@ -413,12 +434,15 @@ def main(args=None):
     if args.wandb:
         wandb.init(
             project="mami-misogyny-classification",
+            name=f"roberta-{args.arm}",
             config={
                 "learning_rate": learning_rate,
                 "architecture": "CLIP-XLMR-Large with GS+CS (-1 layer)",
                 "dataset": "MAMI",
                 "epochs": num_epochs,
                 "batch_size": target_batch_size,
+                "arm": args.arm,
+                "text_sources": sources,
             },
         )
 
@@ -451,10 +475,11 @@ def main(args=None):
     scheduler = ReduceLROnPlateau(optimizer, mode='max', factor=0.1, patience=2)
     scaler = torch.amp.GradScaler(device=device)
 
-    # Check for existing checkpoints
+    # Check for existing checkpoints. Checkpoints are arm-scoped: each modality arm trains
+    # and resumes its own model.
     checkpoint_dir = 'checkpoints'
     os.makedirs(checkpoint_dir, exist_ok=True)
-    checkpoint_path = os.path.join(checkpoint_dir, 'mami_roberta_best_model.pth')
+    checkpoint_path = os.path.join(checkpoint_dir, checkpoint_name('roberta', args.arm))
 
     start_epoch = 0
     # Model selection follows the MAMI-official metric (macro-F1 @ 0.5), not AUROC.
@@ -477,13 +502,11 @@ def main(args=None):
     epochs_without_improvement = 0
     best_model_state = None
 
-    # Define loss configuration for ablation experiments
-    loss_config = {
-        'classification': True,  # Always enabled
-        'contrastive': False,     # Set to False to disable contrastive loss
-        'relevance': True        # Set to False to disable relevance loss
-    }
-    
+    # Loss configuration comes from the modality arm: relevance (and hence caption-scorer
+    # training) is on only for the full-TRACE arm, where there are multiple candidate
+    # captions to rank. See mami_modality.py for why the single-caption arms turn it off.
+    loss_config = loss_config_for(args.arm)
+
     print(f"\nLoss configuration: {loss_config}")
 
     # Modify this line to use start_epoch as the starting point
@@ -536,7 +559,7 @@ def main(args=None):
             torch.cuda.empty_cache()
         
         # Validation
-        val_metrics, _, _ = evaluate_model(base_model, val_dataloaders, device)
+        val_metrics, _, _ = evaluate_model(base_model, val_dataloaders, device, loss_config)
         print("Validation Metrics:")
         print(format_metrics(val_metrics, prefix="  "))
 
@@ -561,6 +584,7 @@ def main(args=None):
         # Save checkpoint after each epoch (overwriting previous checkpoint)
         checkpoint = {
             'epoch': epoch + 1,
+            'arm': args.arm,
             'model_state_dict': base_model.state_dict(),
             'optimizer_state_dict': optimizer.state_dict(),
             'best_val_score': best_val_score,
@@ -578,26 +602,59 @@ def main(args=None):
     if best_model_state is not None:
         base_model.load_state_dict(best_model_state)
 
-    # Select best captions for test set
-    print("\nSelecting best captions for test set...")
-    test_best_captions = select_best_captions(base_model, test_dataset, device, loss_config)
-    test_dataset.best_captions = test_best_captions
+    # Select best captions for the test set. Only meaningful when there is more than one
+    # candidate caption to choose between -- the single-caption ablation arms have nothing
+    # to select, so the pass is skipped rather than run as an expensive no-op.
+    caption_choices = None
+    if len(sources) > 1:
+        print("\nSelecting best captions for test set...")
+        test_dataset.best_captions, caption_choices = select_best_captions(
+            base_model, test_dataset, device, loss_config, return_choices=True
+        )
+        # Which source the scorer actually picked. The candidate captions all describe the
+        # same image under different prompts, so they are highly correlated; this is the
+        # check that the scorer is discriminating between them rather than collapsing onto
+        # one source and making the selection machinery a no-op.
+        print(format_selection_distribution(
+            caption_choices, sources, title="Test set caption selection"
+        ))
+    else:
+        print(f"\nSkipping caption selection (arm '{args.arm}' has a single text source).")
 
     # Final evaluation on the MAMI test split.
-    test_metrics, all_labels, all_preds = evaluate_model(base_model, [test_dataloader], device)
+    test_metrics, all_labels, all_preds = evaluate_model(base_model, [test_dataloader], device, loss_config)
     print("Final Test Metrics:")
     print(format_metrics(test_metrics, prefix="  "))
 
     if args.wandb:
         wandb.log(wandb_metrics(test_metrics, "Test"))
+        if caption_choices:
+            wandb.log({
+                f"CaptionSelection/{src}": frac
+                for src, (_, frac) in selection_distribution(caption_choices, sources).items()
+            })
 
-    # Save all predictions and labels for further analysis
+    # Save all predictions and labels for further analysis. `metrics` is included so the
+    # ablation driver (mami_ablation.py) can build its table straight from these files.
     results = {
-        'labels': all_labels.tolist(),
-        'predictions': all_preds.tolist(),
+        'backbone': 'roberta',
+        'arm': args.arm,
+        'text_sources': sources,
+        # {source name: [count, fraction]} for the scorer's pick on each test row, or null
+        # for the single-caption arms where there is nothing to select.
+        'caption_selection': (
+            {src: [n, frac] for src, (n, frac) in
+             selection_distribution(caption_choices, sources).items()}
+            if caption_choices else None
+        ),
+        'metrics': test_metrics,
+        'labels': [int(x) for x in all_labels],
+        'predictions': [int(x) for x in all_preds],
     }
-    with open('mami_clip_xlm_preds.json', 'w') as f:
+    preds_path = preds_name('roberta', args.arm)
+    with open(preds_path, 'w') as f:
         json.dump(results, f, indent=4)
+    print(f"Wrote predictions -> {preds_path}")
 
 
 def parse_args():
@@ -610,9 +667,15 @@ def parse_args():
     parser.add_argument('--wandb', action='store_true', help="Enable Weights & Biases logging.")
     parser.add_argument('--no-resume', dest='no_resume', action='store_true',
                         help="Ignore an existing checkpoint and start training from scratch.")
-    parser.add_argument('--caption-field', dest='caption_field', default=CAPTION_FIELD,
-                        help="JSON field holding the generated caption (default: ivl_8b_new_caption). "
-                             "Use ivl_caption_unified / ivl_caption_generic for the prompt ablation.")
+    parser.add_argument('--arm', choices=list(ARMS), default=DEFAULT_ARM,
+                        help="Modality ablation arm (default: trace, the unmodified architecture). "
+                             "See MAMI/mami_modality.py.")
+    parser.add_argument('--caption-field', dest='caption_field_override', default=None,
+                        help="Override the JSON caption field this arm reads (default: the arm's "
+                             "own field, i.e. ivl_caption_task for the task caption). For the "
+                             "task/generic/unified prompt comparison use the dedicated arms "
+                             "(image_taskcap / image_genericcap / image_unifiedcap); this flag is "
+                             "for caption sets that have no arm of their own.")
     return parser.parse_args()
 
 

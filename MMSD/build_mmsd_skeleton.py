@@ -8,7 +8,7 @@ multimodal sarcasm detection over Twitter image+text pairs. The captioning scrip
 (`MMSD/mmsd_cap_gen.py`) and the training scripts both read a single JSON (records orient)
 with the columns:
 
-    img, text, label, split, id, ivl_8b_new_caption
+    img, text, label, split, id, ivl_caption_task
 
 Unlike MAMI/Memotion, MMSD2.0 is distributed as HuggingFace parquet shards with the images
 stored as *bytes inside the table*, not as files on disk:
@@ -70,7 +70,7 @@ from mmsd_common import (
 
 # Caption fields the downstream scripts read. Start empty; backfilled by the pipeline.
 # Only InternVL is used (Gemini is not part of the MMSD flow, as with Memotion).
-CAPTION_FIELDS = ["ivl_8b_new_caption"]
+CAPTION_FIELDS = ["ivl_caption_task"]
 
 # How many rows to pull out of a parquet shard at a time. The image bytes make rows large
 # (~100 KB each), so batching keeps peak memory to a few hundred MB rather than loading a
@@ -267,7 +267,7 @@ def main():
     data.to_json(args.output, orient="records", indent=2)
     print(f"\nWrote skeleton JSON -> {args.output}")
     print(
-        "Caption field (ivl_8b_new_caption) is empty and ready to backfill via "
+        "Caption field (ivl_caption_task) is empty and ready to backfill via "
         "MMSD/mmsd_cap_gen.py."
     )
 

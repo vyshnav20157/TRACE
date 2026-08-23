@@ -25,7 +25,7 @@ imported and is equivalent to the above.
 
 import os
 
-MEMOTION_GPU_ID = 0
+MEMOTION_GPU_ID = 1
 
 if MEMOTION_GPU_ID is not None and "CUDA_VISIBLE_DEVICES" not in os.environ:
     os.environ["CUDA_VISIBLE_DEVICES"] = str(MEMOTION_GPU_ID)

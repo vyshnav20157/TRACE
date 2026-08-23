@@ -101,13 +101,20 @@ def collate_fn_open_clip(batch):
         'label': torch.stack([item['label'] for item in batch])
     }
 
-def select_best_captions_by_caption_scorer(model, dataset, device, batch_size=256):
+def select_best_captions_by_caption_scorer(model, dataset, device, batch_size=256,
+                                           return_choices=False):
     """
     Selects the best caption for each image based on caption scorer predictions.
     This is used when relevance loss is present.
+
+    With `return_choices`, also returns {image_id: chosen slot index}. The index is the
+    position in the arm's `sources` list, so callers can report WHICH text source the scorer
+    actually picked -- the check that it is discriminating between candidates rather than
+    collapsing onto one.
     """
     model.eval()
     best_captions = {}
+    chosen_idx = {}
     
     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_fn_generic)
     
@@ -217,21 +224,29 @@ def select_best_captions_by_caption_scorer(model, dataset, device, batch_size=25
                     best_captions[image_id] = dataset.captions[image_id][caption_idx]
                 else:
                     # Default to first caption if selected index is out of bounds
+                    caption_idx = 0
                     best_captions[image_id] = dataset.captions[image_id][0]
-                    
+                chosen_idx[image_id] = caption_idx
+
             # Clear memory after each batch
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
-    
+
+    if return_choices:
+        return best_captions, chosen_idx
     return best_captions
 
-def select_best_captions_by_cosine_similarity(model, dataset, device, batch_size=512):
+def select_best_captions_by_cosine_similarity(model, dataset, device, batch_size=512,
+                                              return_choices=False):
     """
     Selects the best caption for each image based on cosine similarity between image and text features.
     This is used when contrastive loss is present but relevance loss is not.
+
+    `return_choices` behaves as in `select_best_captions_by_caption_scorer`.
     """
     model.eval()
     best_captions = {}
+    chosen_idx = {}
     
     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_fn_generic)
     
@@ -339,12 +354,16 @@ def select_best_captions_by_cosine_similarity(model, dataset, device, batch_size
                     best_captions[image_id] = dataset.captions[image_id][caption_idx]
                 else:
                     # Default to first caption if selected index is out of bounds
+                    caption_idx = 0
                     best_captions[image_id] = dataset.captions[image_id][0]
-                    
+                chosen_idx[image_id] = caption_idx
+
             # Clear memory after each batch
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
-    
+
+    if return_choices:
+        return best_captions, chosen_idx
     return best_captions
 
 def print_caption_selection_debug(image_ids, captions, caption_scores, selected_mask, labels=None, raw_probs=None):
@@ -382,7 +401,9 @@ def print_caption_selection_debug(image_ids, captions, caption_scores, selected_
                 prob_gumbel = selected_mask[i][j].item() if selected_mask is not None else None
                 prob_raw = raw_probs[i][j].item() if raw_probs is not None else None
                 
-                caption_type = "Text" if j == 0 else "InternVL Caption" if j == 1 else "Gemini Caption"
+                # Slot j of the arm's `sources` list; named generically because which
+                # sources are present depends on the arm (see <dataset>_modality.py).
+                caption_type = "Text" if j == 0 else f"Caption {j}"
                 
                 print(f"\n{j+1}. {caption_type}: {image_captions[j]}")
                 
@@ -401,7 +422,8 @@ def print_caption_selection_debug(image_ids, captions, caption_scores, selected_
             
         print("-" * 50)
 
-def select_best_captions(model, dataset, device, loss_config, batch_size=512, verbose=False):
+def select_best_captions(model, dataset, device, loss_config, batch_size=512, verbose=False,
+                         return_choices=False):
     """
     Select best captions based on the loss configuration.
     
@@ -412,23 +434,75 @@ def select_best_captions(model, dataset, device, loss_config, batch_size=512, ve
         loss_config: Dict with keys 'classification', 'contrastive', 'relevance' indicating which losses are active
         batch_size: Batch size for processing
         verbose: Whether to print debug information
+        return_choices: If True, return (best_captions, {image_id: chosen slot index})
+            instead of just best_captions, so callers can report the selection distribution.
     """
     has_relevance = loss_config.get('relevance', False)
     has_contrastive = loss_config.get('contrastive', False)
     
     if has_relevance:
         # If relevance loss is enabled, use caption scorer for selection
-        return select_best_captions_by_caption_scorer(model, dataset, device, batch_size)
+        return select_best_captions_by_caption_scorer(model, dataset, device, batch_size,
+                                                      return_choices=return_choices)
     elif has_contrastive:
         # If only contrastive loss is enabled, use cosine similarity for selection
-        return select_best_captions_by_cosine_similarity(model, dataset, device, batch_size)
+        return select_best_captions_by_cosine_similarity(model, dataset, device, batch_size,
+                                                         return_choices=return_choices)
     else:
         # If only classification loss is used, just use the caption scorer as default
-        return select_best_captions_by_caption_scorer(model, dataset, device, batch_size)
+        return select_best_captions_by_caption_scorer(model, dataset, device, batch_size,
+                                                      return_choices=return_choices)
+
+
+def selection_distribution(chosen_idx, sources):
+    """Tally which text source the scorer picked, as {source name: (count, fraction)}.
+
+    `chosen_idx` maps image_id -> slot index into the row's surviving caption list. Rows whose
+    caption fields were all populated -- the normal case -- index straight into `sources`;
+    a row that dropped an empty field has a shorter list, so its later indices shift down.
+    That skew is small when the columns are near-fully populated, and the printed n lets you
+    see how many rows contributed.
+    """
+    counts = {src: 0 for src in sources}
+    total = 0
+    for idx in chosen_idx.values():
+        if 0 <= idx < len(sources):
+            counts[sources[idx]] += 1
+            total += 1
+    if not total:
+        return {}
+    return {src: (n, n / total) for src, n in counts.items()}
+
+
+def format_selection_distribution(chosen_idx, sources, title="Caption selection distribution"):
+    """Render `selection_distribution` as an aligned block for logs.
+
+    A scorer that is discriminating spreads its picks across sources; one that has collapsed
+    puts nearly everything on a single row, which this makes obvious at a glance.
+    """
+    dist = selection_distribution(chosen_idx, sources)
+    if not dist:
+        return f"\n{title}: no selections recorded."
+
+    width = max(len(src) for src in dist)
+    lines = [f"\n{title} (n={len(chosen_idx)}):"]
+    for src, (count, frac) in dist.items():
+        bar = "#" * int(round(frac * 40))
+        lines.append(f"  {src:<{width}}  {count:>7}  {frac:6.1%}  {bar}")
+
+    top_frac = max(frac for _, frac in dist.values())
+    if top_frac >= 0.95:
+        lines.append(
+            "  NOTE: >=95% of picks land on one source -- the scorer is not discriminating "
+            "between candidates."
+        )
+    return "\n".join(lines)
 
 # Explicitly make functions available for import
 __all__ = [
     'select_best_captions', 
     'print_caption_selection_debug', 
-    'collate_fn_generic'
+    'collate_fn_generic',
+    'selection_distribution',
+    'format_selection_distribution',
 ]

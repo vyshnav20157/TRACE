@@ -261,6 +261,93 @@ Three differences drove the design:
   architecture, loss functions, caption selection, and metrics plumbing are untouched**,
   keeping the comparison to original TRACE clean.
 
+### 5. Modality-importance ablation across all three datasets (current work)
+
+A six-arm ablation, run identically on MAMI, Memotion, and MMSD2.0, that answers *where
+TRACE's performance actually comes from*: the image, the meme's own text, the generated
+caption, or the caption-scoring architecture itself. Every arm holds backbone, splits,
+losses, schedule, and seed fixed and changes only the text stream, so the deltas between
+arms are attributable to the modality.
+
+| Arm | Text stream fed to the model | Caption scoring |
+|-----|------------------------------|-----------------|
+| `image_only` | a fixed constant string | off |
+| `image_text` | the meme's own OCR / tweet text | off |
+| `image_taskcap` | task-specific caption | off |
+| `image_genericcap` | generic-prompt caption | off |
+| `image_unifiedcap` | unified (all-task) caption | off |
+| `trace` | text + **all three** generated captions | **on** |
+
+#### New files
+
+| File | Purpose |
+|------|---------|
+| `MAMI/mami_modality.py`, `Memotion/memotion_modality.py`, `MMSD/mmsd_modality.py` | Arm definitions and everything derived from them: the ordered text-source list per arm, the per-arm loss config, per-arm checkpoint/predictions filenames, and `resolve_arm()`, which validates an arm's caption fields against the dataset JSON before training starts. |
+| `MAMI/mami_ablation.py`, `Memotion/memotion_ablation.py`, `MMSD/mmsd_ablation.py` | Sweep drivers: train every arm (or a chosen subset), then collect all arms' test metrics into one text or markdown table. |
+
+#### Design decisions
+
+- **One code path, one command per arm.** `--arm` is a flag on the existing training
+  entrypoints rather than a separate script, and `trace` is the default — so the reference
+  arm *is* the unmodified pipeline, and every number in the ablation table comes out of the
+  same code. The arms are roberta-only (the primary backbone); passing a non-default `--arm`
+  with `vitl14`/`siglip2` is rejected rather than silently ignored and filed under an
+  ablation name.
+
+- **Single-caption arms disable the relevance loss.** With one candidate the Gumbel-Softmax
+  selection degenerates correctly on its own (softmax over a length-1 vector is exactly 1.0),
+  so no code in `utils/` changes. The relevance loss does *not* degenerate harmlessly: it
+  would train the caption scorer to predict the label from one fixed text, adding a second
+  text-only classifier alongside the real one. Leaving it on would make the single-caption
+  arms "TRACE *plus* an extra head" rather than "TRACE *minus* caption selection", so every
+  arm except `trace` runs with `relevance: False`.
+
+- **`image_only` uses a constant string, not the empty string.** CLIP-family backbones here
+  have no image-only forward path — the classifier head consumes a fused image+text vector,
+  so some text must be supplied. The empty string is not neutral: it still tokenizes to a
+  BOS/EOS pair the model can key on. Every sample instead gets the *same* fixed placeholder,
+  so the text branch contributes one constant vector across the whole dataset and any
+  accuracy above chance is attributable to the image branch.
+
+- **Every arm files its own results.** Checkpoint and predictions filenames are keyed on the
+  arm (and, for Memotion, the task), so arms never overwrite one another and can train
+  concurrently on separate GPUs. `--caption-field` overrides are rejected when they would
+  file one caption set's results under another arm's name — that would silently overwrite a
+  real arm's numbers with a different prompt's — and are rejected on `trace` outright, since
+  it has multiple caption slots and no single one to override.
+
+- **Caption fields are validated before training.** `resolve_arm()` fails fast if an arm's
+  caption field is missing from the dataset JSON or present but empty. Training on a column
+  of empty strings would otherwise silently degrade e.g. `image_genericcap` into an
+  image-only run and quietly invalidate the whole table.
+
+### 6. Caption-selection instrumentation (current work)
+
+`trace` now ranks four highly-correlated candidates (the same image described under three
+different prompts), which raises a question the previous two-candidate setup did not: is the
+scorer genuinely discriminating between them, or has it collapsed onto one source, making
+the selection machinery an expensive no-op?
+
+`utils/caption_selection.py` already computed the winning index and then discarded it. It
+now optionally returns it (`return_choices=True`), and two new helpers —
+`selection_distribution()` and `format_selection_distribution()` — tally which source won
+across the split and render it for logs, with an explicit warning when ≥95% of picks land on
+a single source. This is wired into all three training scripts and all three evaluators:
+printed after the selection pass, saved into the predictions/log JSON under
+`caption_selection`, and logged to wandb as `CaptionSelection/<source>` when `--wandb` is on.
+
+```
+Test set caption selection (n=24):
+  text                      13   54.2%  ######################
+  ivl_caption_task           5   20.8%  ########
+  ivl_caption_generic        3   12.5%  #####
+  ivl_caption_unified        3   12.5%  #####
+```
+
+The changes to `utils/` are strictly additive — `return_choices` defaults to `False` and the
+existing return signature is unchanged — so this is diagnostic instrumentation rather than a
+modification of TRACE's method, and the "reuse over rewrite" guarantee above still holds.
+
 ---
 
 ## Quickstart for MAMI
@@ -285,13 +372,17 @@ python MAMI/train_mami.py --backbone roberta
 python MAMI/train_mami.py --backbone roberta --caption-field ivl_caption_unified
 
 # 4. Evaluate a saved checkpoint
-python MAMI/mami_eval.py --backbone roberta --checkpoint checkpoints/mami_roberta_best_model.pth
+python MAMI/mami_eval.py --backbone roberta --checkpoint checkpoints/mami_roberta_trace_best_model.pth
+
+# 5. Modality ablation: one arm, or the whole sweep + results table
+python MAMI/train_mami.py --arm image_text
+python MAMI/mami_ablation.py --run                  # train every arm, then print the table
+python MAMI/mami_ablation.py --format markdown      # collect only, as markdown
 ```
 
 Each prompt variant writes its **own** sidecar and its own caption field, so two terminals
 never contend for the same file — only `--merge` writes the dataset JSON, and it is run once
-both jobs have finished. Note that two InternVL-8B instances do **not** fit on one 24 GB
-GPU: give each terminal its own device with `--gpu`. The same flags apply as for Memotion
+both jobs have finished. Give each terminal its own device with `--gpu`. The same flags apply as for Memotion
 and MMSD (`--subset N --epochs 1`, `--no-resume`, `--wandb`, `--caption-field`).
 
 ## Quickstart for Memotion
@@ -314,7 +405,11 @@ python Memotion/train_memotion.py --task humour --backbone siglip2
 
 # 4. Evaluate a saved checkpoint
 python Memotion/memotion_eval.py --task humour --backbone roberta \
-    --checkpoint checkpoints/memotion_humour_roberta_best_model.pth
+    --checkpoint checkpoints/memotion_humour_roberta_trace_best_model.pth
+
+# 5. Modality ablation (per task)
+python Memotion/train_memotion.py --task humour --arm image_text
+python Memotion/memotion_ablation.py --run --task humour
 ```
 
 Useful flags: `--subset N --epochs 1` for a smoke test, `--no-resume` to ignore an existing
@@ -339,7 +434,11 @@ python MMSD/train_mmsd.py --backbone vitl14
 
 # 4. Evaluate a saved checkpoint
 python MMSD/mmsd_eval.py --backbone roberta \
-    --checkpoint checkpoints/mmsd_roberta_best_model.pth
+    --checkpoint checkpoints/mmsd_roberta_trace_best_model.pth
+
+# 5. Modality ablation
+python MMSD/train_mmsd.py --arm image_text
+python MMSD/mmsd_ablation.py --run
 ```
 
 The same flags apply as for Memotion (`--subset N --epochs 1`, `--no-resume`, `--wandb`,

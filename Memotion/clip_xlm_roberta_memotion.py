@@ -7,7 +7,12 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
-from PIL import Image
+from PIL import Image, ImageFile
+
+# One Memotion train image (got_GOT-Meme-9.png) is missing its trailing PNG chunk;
+# the pixel data decodes fine apart from the last few rows, so tolerate it rather
+# than dropping the sample.
+ImageFile.LOAD_TRUNCATED_IMAGES = True
 from tqdm import tqdm
 import open_clip
 import numpy as np
@@ -27,9 +32,22 @@ from memotion_common import (
     split_memotion_data,
 )
 from memotion_metrics import SELECTION_METRIC, compute_metrics, format_metrics, wandb_metrics
+from memotion_modality import (
+    ARMS,
+    DEFAULT_ARM,
+    build_captions,
+    checkpoint_name,
+    loss_config_for,
+    preds_name,
+    resolve_arm,
+)
 
 # Import the modules
-from utils.caption_selection import select_best_captions
+from utils.caption_selection import (
+    format_selection_distribution,
+    select_best_captions,
+    selection_distribution,
+)
 from utils.loss_functions import calculate_loss_gs, FocalLoss
 
 # Set seed for reproducibility
@@ -49,17 +67,23 @@ model, _, preprocess = open_clip.create_model_and_transforms(model_name, pretrai
 tokenizer = open_clip.get_tokenizer(model_name)
 hf_tokenizer = tokenizer.tokenizer
 
-# Caption field the dataset reads alongside the meme's own text. Overridden by
-# --caption-field when running the task-specialized caption ablation.
-CAPTION_FIELD = "ivl_8b_new_caption"
+# Legacy default caption field, kept only as the fallback for callers that construct
+# MemeDatasetJSON without an explicit `sources` list. Which caption an actual run reads is
+# decided by the modality arm (see memotion_modality.py): the task arms resolve to the
+# per-task `ivl_caption_<task>` field, and --caption-field overrides that.
+CAPTION_FIELD = "ivl_caption_unified"
 
 
 class MemeDatasetJSON(Dataset):
-    def __init__(self, dataframe, preprocess_fn, tokenizer, caption_field=CAPTION_FIELD):
+    def __init__(self, dataframe, preprocess_fn, tokenizer, caption_field=CAPTION_FIELD, sources=None):
         self.data = dataframe.to_dict(orient='records')
         self.preprocess = preprocess_fn
         self.tokenizer = tokenizer
         self.caption_field = caption_field
+        # `sources` is the modality-ablation arm's ordered text-source list (see
+        # memotion_modality.py). The default reproduces the original TRACE behaviour exactly:
+        # [meme text, ivl caption] -- or just the meme text before captioning has run.
+        self.sources = sources if sources is not None else ['text', caption_field]
         self.images = {}
         self.captions = defaultdict(list)
         self.best_captions = {}
@@ -71,21 +95,11 @@ class MemeDatasetJSON(Dataset):
                 image = Image.open(image_path).convert('RGB')
                 self.images[image_id] = image
 
-                # Memotion uses a single generated caption (InternVL); Gemini is not part
-                # of this flow, so captions are [meme text, ivl caption] -- or just the
-                # meme text before captioning has run.
-                captions = [
-                    str(row.get('text', 'No caption')),
-                    str(row.get(self.caption_field, 'No caption'))
-                ]
-                captions = [cap for cap in captions if cap.strip() and cap.strip().lower() != 'nan']
                 # 35 Memotion memes carry no usable OCR text, so before captioning has run
-                # their caption list would be empty and the tokenizer would fail on []. Keep
-                # the sample (dropping it would silently alter the official test set) and
-                # fall back to a neutral placeholder.
-                if not captions:
-                    captions = ['No caption']
-                self.captions[image_id] = captions
+                # their caption list would be empty and the tokenizer would fail on [].
+                # build_captions keeps the sample (dropping it would silently alter the
+                # official test set) and falls back to a neutral placeholder.
+                self.captions[image_id] = build_captions(row, self.sources)
             else:
                 print(f"Image file {image_path} not found.")
 
@@ -318,8 +332,13 @@ def collate_fn(batch):
     }
 
 
-def evaluate_model(model, dataloaders, device):
-    """Evaluate and return Memotion-official (macro-F1 @0.5) + TRACE-style metrics."""
+def evaluate_model(model, dataloaders, device, loss_config=None):
+    """Evaluate and return Memotion-official (macro-F1 @0.5) + TRACE-style metrics.
+
+    `loss_config` must match the one training used, so the modality-ablation arms score
+    through the same path they were trained on. It defaults to the full-TRACE configuration,
+    which is what the pre-ablation callers (e.g. memotion_eval.py) expect.
+    """
     model.eval()
     all_labels = []
     all_probs = []
@@ -329,11 +348,12 @@ def evaluate_model(model, dataloaders, device):
     total_loss = 0
     total_samples = 0
 
-    loss_config = {
-        'classification': True,  # Always enabled
-        'contrastive': False,     # Set to False to disable contrastive loss
-        'relevance': True        # Set to False to disable relevance loss
-    }
+    if loss_config is None:
+        loss_config = {
+            'classification': True,  # Always enabled
+            'contrastive': False,     # Set to False to disable contrastive loss
+            'relevance': True        # Set to False to disable relevance loss
+        }
 
     with torch.no_grad():
         for dataloader in dataloaders:
@@ -374,6 +394,8 @@ def main(args=None):
     # TRACE machinery expects.
     data = apply_task_labels(data, task)
 
+    sources = resolve_arm(args, data, args.data_path)
+
     train_data, val_data, test_data = split_memotion_data(data)
     if args.subset:
         train_data = train_data.sample(n=min(args.subset, len(train_data)), random_state=42)
@@ -384,9 +406,10 @@ def main(args=None):
 
     # Make dataset accessible globally for logging
     global dataset
-    dataset = MemeDatasetJSON(train_data, preprocess, tokenizer, args.caption_field)
-    val_datasets = [MemeDatasetJSON(val_data, preprocess, tokenizer, args.caption_field)]
-    test_dataset = MemeDatasetJSON(test_data, preprocess, tokenizer, args.caption_field)
+    caption_field = args.caption_field_override or CAPTION_FIELD
+    dataset = MemeDatasetJSON(train_data, preprocess, tokenizer, caption_field, sources)
+    val_datasets = [MemeDatasetJSON(val_data, preprocess, tokenizer, caption_field, sources)]
+    test_dataset = MemeDatasetJSON(test_data, preprocess, tokenizer, caption_field, sources)
 
     # Define actual batch size and gradient accumulation steps
     actual_batch_size = 64
@@ -402,7 +425,7 @@ def main(args=None):
     if args.wandb:
         wandb.init(
             project="memotion-classification",
-            name=f"roberta-{task}",
+            name=f"roberta-{task}-{args.arm}",
             config={
                 "learning_rate": learning_rate,
                 "architecture": "CLIP-XLMR-Large with GS+CS (-1 layer)",
@@ -410,6 +433,8 @@ def main(args=None):
                 "task": task,
                 "epochs": num_epochs,
                 "batch_size": target_batch_size,
+                "arm": args.arm,
+                "text_sources": sources,
             },
         )
 
@@ -442,10 +467,11 @@ def main(args=None):
     scheduler = ReduceLROnPlateau(optimizer, mode='max', factor=0.1, patience=2)
     scaler = torch.amp.GradScaler(device=device)
 
-    # Checkpoints are task-scoped: humour / offensive / sarcasm each train their own model.
+    # Checkpoints are task- AND arm-scoped: humour / offensive / sarcasm each train their own
+    # model, and each modality arm within a task trains its own too.
     checkpoint_dir = 'checkpoints'
     os.makedirs(checkpoint_dir, exist_ok=True)
-    checkpoint_path = os.path.join(checkpoint_dir, f'memotion_{task}_roberta_best_model.pth')
+    checkpoint_path = os.path.join(checkpoint_dir, checkpoint_name(task, 'roberta', args.arm))
 
     start_epoch = 0
     # Model selection follows the OFFICIAL Memotion metric (macro-F1 @ 0.5), not AUROC.
@@ -465,12 +491,10 @@ def main(args=None):
     epochs_without_improvement = 0
     best_model_state = copy.deepcopy(base_model.state_dict())
 
-    # Define loss configuration for ablation experiments
-    loss_config = {
-        'classification': True,  # Always enabled
-        'contrastive': False,     # Set to False to disable contrastive loss
-        'relevance': True        # Set to False to disable relevance loss
-    }
+    # Loss configuration comes from the modality arm: relevance (and hence caption-scorer
+    # training) is on only for the full-TRACE arm, where there are multiple candidate
+    # captions to rank. See memotion_modality.py for why the single-caption arms turn it off.
+    loss_config = loss_config_for(args.arm)
 
     print(f"\nLoss configuration: {loss_config}")
 
@@ -523,7 +547,7 @@ def main(args=None):
             torch.cuda.empty_cache()
 
         # Validation
-        val_metrics, _, _ = evaluate_model(base_model, val_dataloaders, device)
+        val_metrics, _, _ = evaluate_model(base_model, val_dataloaders, device, loss_config)
         print("Validation:")
         print(format_metrics(val_metrics, prefix="  "))
 
@@ -549,6 +573,7 @@ def main(args=None):
         checkpoint = {
             'epoch': epoch + 1,
             'task': task,
+            'arm': args.arm,
             'model_state_dict': best_model_state,
             'optimizer_state_dict': optimizer.state_dict(),
             'best_val_score': best_val_score,
@@ -563,28 +588,56 @@ def main(args=None):
     # Load the best model state
     base_model.load_state_dict(best_model_state)
 
-    # Select best captions for test set
-    print("\nSelecting best captions for test set...")
-    test_best_captions = select_best_captions(base_model, test_dataset, device, loss_config)
-    test_dataset.best_captions = test_best_captions
+    # Select best captions for the test set. Only meaningful when there is more than one
+    # candidate caption to choose between -- the single-caption ablation arms have nothing
+    # to select, so the pass is skipped rather than run as an expensive no-op.
+    caption_choices = None
+    if len(sources) > 1:
+        print("\nSelecting best captions for test set...")
+        test_dataset.best_captions, caption_choices = select_best_captions(
+            base_model, test_dataset, device, loss_config, return_choices=True
+        )
+        # Which source the scorer actually picked. The candidate captions all describe the
+        # same image under different prompts, so they are highly correlated; this is the
+        # check that the scorer is discriminating between them rather than collapsing onto
+        # one source and making the selection machinery a no-op.
+        print(format_selection_distribution(
+            caption_choices, sources, title="Test set caption selection"
+        ))
+    else:
+        print(f"\nSkipping caption selection (arm '{args.arm}' has a single text source).")
 
     # Final evaluation on the Memotion test split.
-    test_metrics, all_preds, all_labels = evaluate_model(base_model, [test_dataloader], device)
+    test_metrics, all_preds, all_labels = evaluate_model(base_model, [test_dataloader], device, loss_config)
     print(f"\nFinal Test Metrics ({task}):")
     print(format_metrics(test_metrics, prefix="  "))
 
     if args.wandb:
         wandb.log(wandb_metrics(test_metrics, "Test"))
+        if caption_choices:
+            wandb.log({
+                f"CaptionSelection/{src}": frac
+                for src, (_, frac) in selection_distribution(caption_choices, sources).items()
+            })
 
     # Save all predictions and labels for further analysis
     results = {
         'task': task,
         'backbone': 'roberta',
+        'arm': args.arm,
+        'text_sources': sources,
+        # {source name: [count, fraction]} for the scorer's pick on each test row, or null
+        # for the single-caption arms where there is nothing to select.
+        'caption_selection': (
+            {src: [n, frac] for src, (n, frac) in
+             selection_distribution(caption_choices, sources).items()}
+            if caption_choices else None
+        ),
         'metrics': test_metrics,
         'labels': [int(x) for x in all_labels],
         'predictions': [int(x) for x in all_preds],
     }
-    preds_path = f'memotion_{task}_roberta_preds.json'
+    preds_path = preds_name(task, 'roberta', args.arm)
     with open(preds_path, 'w') as f:
         json.dump(results, f, indent=4)
     print(f"Wrote predictions -> {preds_path}")
@@ -596,8 +649,15 @@ def parse_args():
                         help="Which Memotion Task B binary problem to train (default: humour).")
     parser.add_argument('--data-path', dest='data_path', default=MEMOTION_DATA_PATH,
                         help="Memotion dataset JSON (records orient) from build_memotion_skeleton.py.")
-    parser.add_argument('--caption-field', dest='caption_field', default=CAPTION_FIELD,
-                        help="JSON field holding the generated caption (default: ivl_8b_new_caption).")
+    parser.add_argument('--arm', choices=list(ARMS), default=DEFAULT_ARM,
+                        help="Modality ablation arm (default: trace, the unmodified architecture). "
+                             "See Memotion/memotion_modality.py.")
+    parser.add_argument('--caption-field', dest='caption_field_override', default=None,
+                        help="Override the JSON caption field this arm reads (default: the arm's "
+                             "own field, i.e. ivl_caption_<task> for the task caption). Use e.g. "
+                             "the dedicated arms (image_taskcap / image_genericcap / "
+                             "image_unifiedcap) for the prompt comparison; this flag is for "
+                             "caption sets that have no arm of their own.")
     parser.add_argument('--epochs', type=int, default=30)
     parser.add_argument('--subset', type=int, default=None,
                         help="Train on N sampled train rows (val/test scaled down) for smoke tests.")
