@@ -28,8 +28,11 @@ from mmsd_metrics import SELECTION_METRIC, compute_metrics, format_metrics, wand
 from mmsd_modality import (
     ARMS,
     DEFAULT_ARM,
+    DEFAULT_CAPTIONER,
+    FIELD_PREFIX,
     build_captions,
     checkpoint_name,
+    default_caption_field,
     loss_config_for,
     preds_name,
     resolve_arm,
@@ -439,7 +442,10 @@ def main(args=None):
 
     print(f"Splits -> train {len(train_data)} | val {len(val_data)} | test {len(test_data)}")
 
-    caption_field = args.caption_field_override or CAPTION_FIELD
+    # The dataset's default caption column follows the chosen captioner, so an arm that
+    # does not name a caption field still reads that captioner's captions rather than
+    # silently falling back to InternVL's.
+    caption_field = args.caption_field_override or default_caption_field(args.captioner)
     train_dataset = MemeDatasetJSON(train_data, clip_processor, caption_field, sources)
     val_datasets = [MemeDatasetJSON(val_data, clip_processor, caption_field, sources)]
     test_dataset = MemeDatasetJSON(test_data, clip_processor, caption_field, sources)
@@ -500,9 +506,13 @@ def main(args=None):
         min_lr=1e-7  # Minimum LR to prevent it from becoming too small
     )
 
+    # A --subset run is a smoke test: it writes to its own `_smoke` filenames so it can
+    # never overwrite the real, fully-trained results for this arm.
+    if args.subset:
+        print(f"[smoke] --subset {args.subset}: writing to _smoke checkpoint/preds files")
     checkpoint_dir = 'checkpoints'
     os.makedirs(checkpoint_dir, exist_ok=True)
-    checkpoint_path = os.path.join(checkpoint_dir, checkpoint_name('vitl14', args.arm))
+    checkpoint_path = os.path.join(checkpoint_dir, checkpoint_name('vitl14', args.arm, args.captioner, bool(args.subset)))
 
     start_epoch = 0
     # Model selection follows the OFFICIAL MMSD metric (sarcastic-class F1 @ 0.5), not AUROC.
@@ -632,7 +642,7 @@ def main(args=None):
         'predictions': [int(pred) for pred in all_preds],
         'labels': [int(label) for label in all_labels],
     }
-    preds_path = preds_name('vitl14', args.arm)
+    preds_path = preds_name('vitl14', args.arm, args.captioner, bool(args.subset))
     with open(preds_path, 'w') as f:
         json.dump(test_results, f, indent=4)
     print(f"Wrote predictions -> {preds_path}")
@@ -645,6 +655,12 @@ def parse_args():
     parser.add_argument('--arm', choices=list(ARMS), default=DEFAULT_ARM,
                         help="Modality ablation arm (default: trace, the unmodified architecture). "
                              "See MMSD/mmsd_modality.py.")
+    parser.add_argument('--captioner', choices=list(FIELD_PREFIX), default=DEFAULT_CAPTIONER,
+                        help="Which captioner's caption set this arm reads (default: "
+                             "internvl, the primary). 'qwen' reads the qwen_caption_* "
+                             "fields for the captioner ablation. Checkpoints and "
+                             "predictions are namespaced by captioner, so a qwen run "
+                             "never overwrites the internvl results for the same arm.")
     parser.add_argument('--caption-field', dest='caption_field_override', default=None,
                         help="Override the JSON caption field this arm reads (default: the arm's "
                              "own field). For the task/generic/unified prompt comparison use the "

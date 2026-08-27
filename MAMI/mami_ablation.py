@@ -42,7 +42,7 @@ import os
 import subprocess
 import sys
 
-from mami_modality import ARMS, get_arm, preds_name
+from mami_modality import ARMS, DEFAULT_CAPTIONER, FIELD_PREFIX, get_arm, preds_name
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TRAIN_SCRIPT = os.path.join(REPO_ROOT, "MAMI", "train_mami.py")
@@ -68,9 +68,13 @@ ARM_ORDER = ["image_only", "image_text", "image_taskcap", "image_genericcap",
              "image_unifiedcap", "trace"]
 
 
-def train_arm(arm, backbone, extra_args):
+def train_arm(arm, backbone, captioner, extra_args):
     """Train a single arm in its own subprocess. Returns True on success."""
-    cmd = [sys.executable, TRAIN_SCRIPT, "--backbone", backbone, "--arm", arm] + extra_args
+    # --captioner is passed explicitly rather than left to `extra_args`, because the same
+    # value must reach BOTH the training subprocess and `load_results` below; forwarding it
+    # only through the passthrough would train qwen arms and then collect internvl files.
+    cmd = ([sys.executable, TRAIN_SCRIPT, "--backbone", backbone, "--arm", arm,
+            "--captioner", captioner] + extra_args)
     print(f"\n{'=' * 78}\n[ablation] training arm '{arm}' ({backbone})"
           f"\n[ablation] $ {' '.join(cmd)}\n{'=' * 78}")
     result = subprocess.run(cmd, cwd=REPO_ROOT)
@@ -80,11 +84,11 @@ def train_arm(arm, backbone, extra_args):
     return True
 
 
-def load_results(backbone, arms):
+def load_results(backbone, arms, captioner, smoke=False):
     """Load each arm's test-prediction JSON, skipping arms that have not been run."""
     results = {}
     for arm in arms:
-        path = os.path.join(REPO_ROOT, preds_name(backbone, arm))
+        path = os.path.join(REPO_ROOT, preds_name(backbone, arm, captioner, smoke))
         if not os.path.exists(path):
             continue
         with open(path) as f:
@@ -99,10 +103,10 @@ def load_results(backbone, arms):
     return results
 
 
-def format_table(results, backbone, fmt="text"):
+def format_table(results, backbone, captioner, fmt="text"):
     """Render the collected per-arm metrics as an aligned text or markdown table."""
     arms = [a for a in ARM_ORDER if a in results]
-    title = f"MAMI modality ablation -- backbone: {backbone}"
+    title = f"MAMI modality ablation -- backbone: {backbone} | captioner: {captioner}"
     if not arms:
         return (
             f"\n{title}\n"
@@ -154,6 +158,11 @@ def main():
     parser.add_argument("--backbone", default="roberta", choices=["roberta"],
                         help="Backbone to run the sweep on. Roberta only -- the arms are "
                              "implemented in clip_xlm_roberta_mami.py.")
+    parser.add_argument("--captioner", choices=list(FIELD_PREFIX), default=DEFAULT_CAPTIONER,
+                        help="Which captioner's caption sets the sweep trains on and "
+                             "collects (default: internvl). Run the sweep once per "
+                             "captioner to build the captioner-ablation comparison; "
+                             "results are filed separately so the two never collide.")
     parser.add_argument("--format", dest="fmt", default="text", choices=["text", "markdown"],
                         help="Table format (default: text).")
     parser.add_argument("--out", default=None,
@@ -162,16 +171,21 @@ def main():
     # to each training run, so the sweep can be smoke-tested or configured as a whole.
     args, extra = parser.parse_known_args()
 
+    # A --subset sweep trains smoke runs, which write `_smoke` prediction files; collect
+    # from those so the table reflects the run that just happened rather than silently
+    # showing stale real results (or nothing at all).
+    smoke = any(a == "--subset" or a.startswith("--subset=") for a in extra)
+
     if args.run:
         failed = []
         for arm in args.arms:
-            if not train_arm(arm, args.backbone, extra):
+            if not train_arm(arm, args.backbone, args.captioner, extra):
                 failed.append(arm)
         if failed:
             print(f"\n[ablation] arms that failed: {', '.join(failed)}")
 
-    results = load_results(args.backbone, args.arms)
-    table = format_table(results, args.backbone, args.fmt)
+    results = load_results(args.backbone, args.arms, args.captioner, smoke)
+    table = format_table(results, args.backbone, args.captioner, args.fmt)
     print(table)
 
     if args.out:

@@ -1,4 +1,4 @@
-"""MAMI caption generation: RAM++ tags -> GroundingDINO boxes -> InternVL caption.
+"""MAMI caption generation: RAM++ tags -> GroundingDINO boxes -> VLM caption.
 
 This mirrors `MMSD/mmsd_cap_gen.py` but is driven by the MAMI skeleton JSON produced by
 `MAMI/build_mami_skeleton.py`. As with Memotion and MMSD, Gemini is not part of this flow:
@@ -25,6 +25,27 @@ Every prompt asks for descriptive language and forbids verdict labels ("this is
 misogynistic", "this is sexist") -- the classifier must infer the label, so a caption that
 states it would leak the target.
 
+Captioner ablation (--captioner)
+--------------------------------
+`--captioner internvl` (default) is the primary captioner, InternVL2_5-8B, and writes the
+`ivl_caption_*` fields every published run uses. `--captioner qwen` runs Qwen2.5-VL-7B-Instruct
+instead and writes `qwen_caption_*`, so the two caption sets coexist in this dataset JSON and
+can be trained and compared as a captioner ablation.
+
+Only the captioner changes. The RAM++ tag pass, the GroundingDINO boxes and their thresholds,
+the grounding block, the prompt text, greedy decoding, the 80-token generation cap, the
+SigLIP2 64-token trim, and the image list and its order are all shared code and run
+identically for both -- see `utils/captioner_backends.py`, which also pins Qwen to InternVL's
+448x448 visual budget (Qwen's processor is dynamic-resolution by default, which would
+otherwise confound "different captioner" with "different amount of visual detail").
+
+Each captioner keeps its own sidecars, trackers, caption fields, checkpoints, and predictions
+files, so a Qwen run can never overwrite an InternVL result.
+
+Qwen2.5-VL needs transformers >= 4.49, while the training env is pinned at 4.46.3 for
+InternVL/RAM/open_clip/LAVIS. Run the Qwen captioning pass in the separate `trace-qwen` env
+(see ToDo.md); merging and training happen back in the `trace` env as usual.
+
 Output / concurrency
 --------------------
 A run writes ONLY its own per-variant sidecar (`mami_captions_complete.<variant>.json`, a
@@ -47,6 +68,7 @@ Requires: `ram_plus_swin_large_14m.pth` and
 Usage:
     python MAMI/mami_cap_gen.py                        # misogyny prompt (primary)
     python MAMI/mami_cap_gen.py --prompt all           # unified-prompt ablation
+    python MAMI/mami_cap_gen.py --captioner qwen     # captioner ablation (trace-qwen env)
     python MAMI/mami_cap_gen.py --limit 5              # smoke test
 
     # Two variants at once, one per GPU (run in separate terminals):
@@ -101,10 +123,16 @@ from ram.models import ram_plus
 # ---------------------------------------------------------------------------
 from mami_common import MAMI_IMAGE_ROOT as MAMI_ROOT, MAMI_DATA_PATH as DEFAULT_JSON
 
+# Captioner backends for the captioner ablation. The dataset script owns the whole
+# pipeline (grounding, prompt, budget, resume, merge); the backend supplies ONLY the
+# image+prompt -> string step, which is what keeps the ablation single-variable.
+from utils.captioner_backends import caption_field, get_backend
+
 # Grounding + captioning model assets (repo-root relative, as in vg_caption_gen.py).
 RAM_PRETRAINED_PATH = "ram_plus_swin_large_14m.pth"
 RAM_IMAGE_SIZE = 384
-INTERNVL_MODEL = "OpenGVLab/InternVL2_5-8B"
+# Captioner model ids live in utils/captioner_backends.py, one per backend, so the
+# ablation's two models are declared side by side with the controls that equalize them.
 GROUNDING_MODEL = "IDEA-Research/grounding-dino-base"
 
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
@@ -119,22 +147,22 @@ if torch.cuda.is_available():
 # finished sidecars back into the main JSON.
 PROMPT_CONFIG = {
     "misogyny": {
-        "field": "ivl_caption_task",
-        "tracker": "processed_mami_misogyny_images.txt",
+        "suffix": "task",
+        "legacy_tracker": "processed_mami_misogyny_images.txt",
     },
     "all": {
-        "field": "ivl_caption_unified",
-        "tracker": "processed_mami_unified_images.txt",
+        "suffix": "unified",
+        "legacy_tracker": "processed_mami_unified_images.txt",
     },
     "generic": {
-        "field": "ivl_caption_generic",
-        "tracker": "processed_mami_generic_images.txt",
+        "suffix": "generic",
+        "legacy_tracker": "processed_mami_generic_images.txt",
     },
 }
 
 
-def shard_path(json_path: str, variant: str) -> str:
-    """Path of the per-variant caption sidecar for `variant`.
+def shard_path(json_path: str, variant: str, backend: str = "internvl") -> str:
+    """Path of the per-(variant, backend) caption sidecar.
 
     Concurrency: two cap-gen runs in two terminals would otherwise both load the whole
     dataset JSON and rewrite it after every image, so each would serialize a snapshot taken
@@ -143,10 +171,31 @@ def shard_path(json_path: str, variant: str) -> str:
     entirely -- no locking, and a crashed run can never corrupt another variant's captions.
 
     The sidecar is a flat {img: caption} map, written next to the dataset JSON as
-    e.g. `mami_captions_complete.misogyny.json`.
+    e.g. `mami_captions_complete.<variant>.json`.
+
+    Captioner ablation: the `qwen` backend appends its name
+    (`mami_captions_complete.<variant>.qwen.json`) so its caption sets sit alongside
+    InternVL's instead of colliding with them. InternVL keeps the un-suffixed historical
+    names -- every sidecar, `.bak`, and tracker already on disk stays exactly where the
+    existing runs left it, so switching to this version re-captions nothing.
     """
     base, ext = os.path.splitext(json_path)
-    return f"{base}.{variant}{ext}"
+    suffix = "" if backend == "internvl" else f".{backend}"
+    return f"{base}.{variant}{suffix}{ext}"
+
+
+def tracker_path(variant: str, backend: str = "internvl") -> str:
+    """Resume-tracker path for a (variant, backend) pair.
+
+    InternVL returns the historical per-variant tracker filename recorded in PROMPT_CONFIG,
+    so an interrupted InternVL run still resumes off the file it has been appending to.
+    Other backends get their own namespaced tracker, so a Qwen run neither reads InternVL's
+    completed-image list (which would make it skip every image and produce nothing) nor
+    appends to it (which would make a later InternVL run skip images it never captioned).
+    """
+    if backend == "internvl":
+        return PROMPT_CONFIG[variant]["legacy_tracker"]
+    return f"processed_mami_{variant}_{backend}_images.txt"
 
 
 def load_shard(path: str) -> Dict[str, str]:
@@ -330,9 +379,8 @@ def format_grounding_prompt(grounding_info: Dict[str, List[Tuple]]) -> str:
 CAPTION_TOKEN_BUDGET = 64
 _LENGTH_TOKENIZER = "google/siglip2-base-patch16-224"
 
-# ~80 new tokens leaves headroom for the "Caption:" preamble while still stopping the
-# model from rambling into a 120-word paragraph.
-CAPTION_MAX_NEW_TOKENS = 80
+# The generation cap (CAPTION_MAX_NEW_TOKENS) now lives in utils/captioner_backends.py so
+# both captioners provably share one value; see that module.
 
 _length_tokenizer = None
 
@@ -376,45 +424,29 @@ def fit_to_budget(caption: str, budget: int = CAPTION_TOKEN_BUDGET) -> str:
 
 
 # ---------------------------------------------------------------------------
-# InternVL captioner (primary, GPU)
+# Captioner (backend-dispatched)
 # ---------------------------------------------------------------------------
-def load_internvl():
-    model = (
-        AutoModel.from_pretrained(
-            INTERNVL_MODEL,
-            torch_dtype=torch.bfloat16,
-            low_cpu_mem_usage=True,
-            trust_remote_code=True,
-        )
-        .eval()
-        .to(device)
-    )
-    tokenizer = AutoTokenizer.from_pretrained(INTERNVL_MODEL, trust_remote_code=True, use_fast=False)
-    return model, tokenizer
+# The model that turns (image, prompt) into a caption is the ONE thing the captioner
+# ablation varies. Everything above -- RAM++ tags, GroundingDINO boxes and thresholds,
+# the grounding block, the prompt text -- and everything below -- the token budget, the
+# image list and its order, resume, merge -- is shared by both backends, so a difference
+# between the two caption sets is attributable to the captioner alone.
+# See utils/captioner_backends.py for the controls each backend pins (notably the 448x448
+# visual budget and greedy decoding, held identical across models).
+def load_captioner(backend: str):
+    """Instantiate the captioner backend (`internvl` or `qwen`) on this run's device."""
+    return get_backend(backend)(device)
 
 
-def load_image_internvl(image_path, input_size=448):
-    image = Image.open(image_path).convert("RGB")
-    transform = T.Compose(
-        [
-            T.Resize((input_size, input_size)),
-            T.ToTensor(),
-            T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-        ]
-    )
-    return transform(image).unsqueeze(0).to(device)
+def generate_caption(image_path: str, grounding_info, captioner, variant: str) -> str:
+    """Caption one image: build the shared prompt, run the backend, trim to budget.
 
-
-def generate_caption_internvl(image_path: str, grounding_info, model, tokenizer, variant: str) -> str:
-    pixel_values = load_image_internvl(image_path).to(torch.bfloat16).to(device)
+    The prompt is built here, not in the backend, so both backends receive byte-identical
+    instruction text. `fit_to_budget` is likewise applied here, so both caption sets are
+    trimmed to the same SigLIP2 64-token budget at the same sentence boundaries.
+    """
     prompt = build_prompt(format_grounding_prompt(grounding_info), variant)
-    generation_config = dict(
-        max_new_tokens=CAPTION_MAX_NEW_TOKENS,
-        do_sample=False,
-        pad_token_id=tokenizer.pad_token_id,
-    )
-    with torch.no_grad():
-        response = model.chat(tokenizer, pixel_values, prompt, generation_config)
+    response = captioner.caption(image_path, prompt)
     caption = response.split("Caption:")[-1].strip() if "Caption:" in response else response.strip()
     return fit_to_budget(caption)
 
@@ -426,9 +458,9 @@ def is_empty(val) -> bool:
     return pd.isna(val) or str(val).strip() in ("", "None", "nan")
 
 
-def process(json_path: str, variant: str, limit: int = None, save_every: int = 20):
-    tracker_file = PROMPT_CONFIG[variant]["tracker"]
-    out_path = shard_path(json_path, variant)
+def process(json_path: str, variant: str, backend: str, limit: int = None, save_every: int = 20):
+    tracker_file = tracker_path(variant, backend)
+    out_path = shard_path(json_path, variant, backend)
 
     # The dataset JSON is read-only here: it supplies the image list, nothing more.
     with open(json_path, "r") as f:
@@ -446,8 +478,8 @@ def process(json_path: str, variant: str, limit: int = None, save_every: int = 2
     todo = [img for img in images if img not in processed]
     if limit is not None:
         todo = todo[:limit]
-    print(f"[{variant}] {len(todo)} images to caption -> {out_path} (of {len(images)} total)")
-    print(f"[{variant}] GPU: CUDA_VISIBLE_DEVICES="
+    print(f"[{backend}/{variant}] {len(todo)} images to caption -> {out_path} (of {len(images)} total)")
+    print(f"[{backend}/{variant}] GPU: CUDA_VISIBLE_DEVICES="
           f"{os.environ.get('CUDA_VISIBLE_DEVICES', '<unset>')}")
     if not todo:
         return
@@ -458,17 +490,15 @@ def process(json_path: str, variant: str, limit: int = None, save_every: int = 2
     gd_processor = AutoProcessor.from_pretrained(GROUNDING_MODEL)
     gd_model = AutoModelForZeroShotObjectDetection.from_pretrained(GROUNDING_MODEL).to(device)
 
-    internvl_model, internvl_tokenizer = load_internvl()
+    captioner = load_captioner(backend)
 
     since_save = 0
-    for img_rel in tqdm(todo, desc=f"Captioning ({variant})", unit="image"):
+    for img_rel in tqdm(todo, desc=f"Captioning ({backend}/{variant})", unit="image"):
         image_path = os.path.join(MAMI_ROOT, img_rel)
         try:
             tags = recognize_tags(image_path, ram_model, transform)
             grounding_info = extract_grounding_info(image_path, tags, gd_processor, gd_model)
-            caption = generate_caption_internvl(
-                image_path, grounding_info, internvl_model, internvl_tokenizer, variant
-            )
+            caption = generate_caption(image_path, grounding_info, captioner, variant)
 
             if caption is None or not str(caption).strip():
                 print(f"Empty caption for {img_rel}; skipping.")
@@ -490,12 +520,14 @@ def process(json_path: str, variant: str, limit: int = None, save_every: int = 2
             continue
 
     save_shard(out_path, captions)
-    print(f"[{variant}] done. {len(captions)} captions in {out_path}")
-    print(f"[{variant}] merge into the dataset JSON with: "
-          f"python MAMI/mami_cap_gen.py --merge --prompt {variant}")
+    print(f"[{backend}/{variant}] done. {len(captions)} captions in {out_path}")
+    # The hint carries --captioner too: merging without it would fold this run's sidecar
+    # into the OTHER backend's caption field, silently mixing the two arms of the ablation.
+    print(f"[{backend}/{variant}] merge into the dataset JSON with: "
+          f"python MAMI/mami_cap_gen.py --merge --prompt {variant} --captioner {backend}")
 
 
-def merge(json_path: str, variants: List[str]) -> None:
+def merge(json_path: str, variants: List[str], backend: str) -> None:
     """Fold per-variant caption sidecars back into the main dataset JSON.
 
     Run this once the concurrent caption runs have finished. It is the only step that
@@ -507,17 +539,17 @@ def merge(json_path: str, variants: List[str]) -> None:
     df = pd.DataFrame(data)
 
     for variant in variants:
-        field = PROMPT_CONFIG[variant]["field"]
-        path = shard_path(json_path, variant)
+        field = caption_field(backend, PROMPT_CONFIG[variant]["suffix"])
+        path = shard_path(json_path, variant, backend)
         captions = load_shard(path)
         if not captions:
-            print(f"[merge] {variant}: no captions at {path}, skipping")
+            print(f"[merge] {backend}/{variant}: no captions at {path}, skipping")
             continue
         if field not in df.columns:
             df[field] = ""
         filled = df["img"].map(captions)
         df[field] = filled.where(filled.notna(), df[field]).fillna("")
-        print(f"[merge] {variant}: {int(filled.notna().sum())} captions -> '{field}'")
+        print(f"[merge] {backend}/{variant}: {int(filled.notna().sum())} captions -> '{field}'")
 
     df.to_json(json_path, orient="records", indent=2)
     print(f"[merge] wrote {json_path}")
@@ -555,6 +587,16 @@ def main():
         "after the caption jobs finish, never while one is running.",
     )
     parser.add_argument(
+        "--captioner",
+        choices=["internvl", "qwen"],
+        default="internvl",
+        help="Which VLM writes the captions. 'internvl' (default) is the primary "
+        "captioner and writes the ivl_caption_* fields the published runs use; 'qwen' "
+        "(Qwen2.5-VL-7B-Instruct) writes qwen_caption_* for the captioner ablation. "
+        "Everything else about the pipeline is identical between the two, so the caption "
+        "sets differ by captioner alone. Qwen needs transformers>=4.49 -- see ToDo.md.",
+    )
+    parser.add_argument(
         "--save-every",
         type=int,
         default=20,
@@ -565,10 +607,10 @@ def main():
     if args.merge:
         # --prompt has a default, so only treat it as a filter if given explicitly.
         explicit = any(a.startswith("--prompt") for a in sys.argv[1:])
-        merge(args.json, [args.prompt] if explicit else list(PROMPT_CONFIG))
+        merge(args.json, [args.prompt] if explicit else list(PROMPT_CONFIG), args.captioner)
         return
 
-    process(args.json, args.prompt, args.limit, args.save_every)
+    process(args.json, args.prompt, args.captioner, args.limit, args.save_every)
 
 
 if __name__ == "__main__":

@@ -15,7 +15,7 @@ Set MAMI_GPU_ID = None to leave CUDA_VISIBLE_DEVICES untouched (all GPUs visible
 
 import os
 
-MAMI_GPU_ID = 1
+MAMI_GPU_ID = 0
 
 if MAMI_GPU_ID is not None and "CUDA_VISIBLE_DEVICES" not in os.environ:
     os.environ["CUDA_VISIBLE_DEVICES"] = str(MAMI_GPU_ID)

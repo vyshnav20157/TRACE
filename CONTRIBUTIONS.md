@@ -348,6 +348,105 @@ The changes to `utils/` are strictly additive — `return_choices` defaults to `
 existing return signature is unchanged — so this is diagnostic instrumentation rather than a
 modification of TRACE's method, and the "reuse over rewrite" guarantee above still holds.
 
+### 7. Captioner ablation: InternVL vs. Qwen2.5-VL (current work)
+
+The modality ablation (§5) answers *which text stream* matters; this ablation asks a
+narrower question about the one stream that TRACE is built around: **how much of that
+stream's contribution is specific to InternVL2_5-8B**, versus any captioner writing
+grounded descriptions from the same prompts? A second VLM, Qwen2.5-VL-7B-Instruct, is run
+through the identical pipeline as a control, on all three datasets.
+
+Answering this cleanly requires the captioner to be the *only* thing that differs between
+the two caption sets — the RAM++ tags, GroundingDINO boxes and thresholds, the grounding
+block, the prompt text, the decoding strategy, the token budget, and the image list and its
+order all have to be bit-identical. That is a structural guarantee, not a discipline one, so
+it is enforced by a new shared module rather than by writing the second captioner inline in
+each `*_cap_gen.py`.
+
+#### New file
+
+| File | Purpose |
+|------|---------|
+| `utils/captioner_backends.py` | `InternVLCaptioner` and `QwenCaptioner`, both exposing one `caption(image_path, prompt) -> str` method. Owns exactly the two things a captioner is allowed to vary: model weights and decoding envelope. Everything upstream (grounding, prompt construction) and downstream (token-budget trim, resume, merge) stays in the per-dataset `*_cap_gen.py` scripts, which call in here only for the final image+prompt→string step. |
+
+#### Design decisions
+
+- **A backend can only touch the caption text.** The per-dataset caption-gen scripts build
+  the prompt, walk the image list, and trim the output; the backend is handed one image and
+  one finished prompt string and returns one string back. There is no channel for a backend
+  to see or change the grounding block, the token budget, or the image order, which is what
+  makes "the captioner is the only independent variable" a property of the code rather than
+  something that has to be checked by re-reading two long scripts side by side.
+
+- **Resolution pinned across models.** Qwen2.5-VL's processor is natively dynamic-resolution
+  — left alone it assigns each image a different visual token budget from its aspect ratio,
+  which would confound "different captioner" with "different amount of visual detail" fed to
+  each. `QwenCaptioner` pins `min_pixels == max_pixels == 448×448`, matching the single tile
+  `InternVLCaptioner` has always used (`load_image_internvl`'s plain `Resize`, not InternVL's
+  dynamic multi-tile preprocessing). This also means the resolution InternVL was already
+  generating captions at doesn't need to change for the comparison to be fair — the existing
+  `ivl_caption_*` fields are valid as the control arm without regenerating.
+
+- **Same decoding, same budget, cleared sampling defaults.** Both backends decode greedily
+  (`do_sample=False`) with the same `CAPTION_MAX_NEW_TOKENS = 80`, held in the shared module
+  so the two cannot drift apart by editing one file and forgetting the other. Qwen's
+  generation config ships default sampling params that transformers otherwise warns about
+  under greedy decoding; they're explicitly cleared (not just overridden) so nothing
+  sampling-related is left ambiguous in the run log.
+
+- **Prompt text passes through unmodified.** Both backends receive the same prompt string
+  from the dataset script. InternVL's chat template wants a literal `<image>\n` prefix; Qwen
+  carries the image as a structured content part instead, so `QwenCaptioner` strips exactly
+  that prefix (anchored to the start of the string) and passes the remaining instruction text
+  through byte-for-byte — neither backend adds, removes, or reorders a word of it.
+
+- **Namespaced fields, sidecars, trackers, checkpoints, and predictions — InternVL keeps its
+  historical names.** `FIELD_PREFIX` maps `internvl → ivl_caption` (unchanged) and
+  `qwen → qwen_caption`, so both caption sets coexist in one dataset JSON. Every artifact a
+  captioner touches downstream carries the same rule: InternVL's un-suffixed filenames are
+  preserved exactly (so nothing already on disk — sidecars, `.bak` files, trackers,
+  checkpoints, predictions — is invalidated by this change), and Qwen gets its name appended
+  (`mami_captions_complete.task.qwen.json`, `mami_qwen_roberta_trace_best_model.pth`, …).
+  `--merge` requires `--captioner` to match the run being merged, so a mismatched merge can't
+  silently fold one backend's captions into the other's field.
+
+- **Ablation arms are re-pointed at a captioner, not duplicated per captioner.** The six
+  modality arms (§5) are defined once, in InternVL's field names, as the single source of
+  truth for *which role* a caption plays (task / generic / unified). `*_modality.py` adds
+  `captioner_sources()`, which rewrites an arm's caption fields to the chosen backend's
+  namespace by role — `image_taskcap` under `--captioner qwen` reads `qwen_caption_task`
+  without a second arm definition existing anywhere. `owning_arm()` (replacing the old flat
+  `ARM_BY_CAPTION_FIELD` table) resolves ownership by field *suffix* rather than by listing
+  every InternVL field name, so the `--caption-field` override guard (§5) keeps catching
+  mis-filed overrides for both captioners instead of silently exempting the second one.
+
+- **`--captioner` is roberta-only, enforced with a clear error.** Like `--arm`, the flag only
+  exists on the primary backbone's parser. `train_mami.py`/`train_memotion.py`/
+  `train_mmsd.py` check for `--captioner` in the forwarded args before dispatch and raise a
+  specific error if it's paired with `vitl14`/`siglip2`, rather than letting it reach a
+  parser that has never heard of the flag and fail with an unrelated argparse error.
+
+- **Separate conda env for generation only.** Qwen2.5-VL-7B needs `transformers>=4.49`;
+  `trace` is pinned at 4.46.3 because InternVL, RAM, open_clip, and LAVIS all depend on that
+  pin. `HowToRequirements.md` documents a new `trace-qwen` env for the caption-*generation*
+  step only — merging, training, and eval all stay in `trace`, since by that point the
+  captions are just JSON columns. `trace-qwen` deliberately pins the same `torch==2.3.1`
+  as `trace` so the shared RAM++/GroundingDINO grounding stage behaves identically in both
+  environments; only `transformers` and `timm` move, and `timm==0.9.16` (not RAM's own
+  `0.4.12` pin) is required there because GroundingDINO's `AutoModel` lookup enumerates every
+  model config and imports the timm wrapper even though no timm model is actually used.
+
+### 8. Smoke-run filename isolation (current work)
+
+A `--subset N` run (used to sanity-check a change before committing to a full training run)
+was writing to the same checkpoint and predictions filenames as a real run of that arm,
+so a smoke test could silently overwrite hours of real training if run against an
+already-completed arm. `checkpoint_name()`/`preds_name()` in all three `*_modality.py` now
+take a `smoke` flag and append `_smoke` to the filename when `--subset` is set; the ablation
+drivers (`*_ablation.py`) detect `--subset` in the forwarded args and collect from the
+`_smoke` files so the results table reflects the run that just happened. Smoke files are
+never produced by a full run and are safe to delete at any time.
+
 ---
 
 ## Quickstart for MAMI
@@ -378,12 +477,19 @@ python MAMI/mami_eval.py --backbone roberta --checkpoint checkpoints/mami_robert
 python MAMI/train_mami.py --arm image_text
 python MAMI/mami_ablation.py --run                  # train every arm, then print the table
 python MAMI/mami_ablation.py --format markdown      # collect only, as markdown
+
+# 6. Captioner ablation: generate Qwen captions in the `trace-qwen` env, then
+#    train/eval/sweep exactly as above with --captioner qwen (still in `trace`)
+conda run -n trace-qwen python MAMI/mami_cap_gen.py --captioner qwen
+conda run -n trace-qwen python MAMI/mami_cap_gen.py --merge --captioner qwen
+python MAMI/train_mami.py --arm image_taskcap --captioner qwen
+python MAMI/mami_ablation.py --run --captioner qwen
 ```
 
 Each prompt variant writes its **own** sidecar and its own caption field, so two terminals
 never contend for the same file — only `--merge` writes the dataset JSON, and it is run once
 both jobs have finished. Give each terminal its own device with `--gpu`. The same flags apply as for Memotion
-and MMSD (`--subset N --epochs 1`, `--no-resume`, `--wandb`, `--caption-field`).
+and MMSD (`--subset N --epochs 1`, `--no-resume`, `--wandb`, `--caption-field`, `--captioner`).
 
 ## Quickstart for Memotion
 

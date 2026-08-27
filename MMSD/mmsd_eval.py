@@ -35,9 +35,12 @@ from mmsd_metrics import format_metrics
 from mmsd_modality import (
     ARMS,
     DEFAULT_ARM,
+    DEFAULT_CAPTIONER,
+    FIELD_PREFIX,
     arm_sources,
     check_override,
     checkpoint_name,
+    default_caption_field,
     describe_arm,
     loss_config_for,
 )
@@ -97,6 +100,11 @@ def main():
     parser.add_argument("--arm", choices=list(ARMS), default=DEFAULT_ARM,
                         help="Modality ablation arm the checkpoint was TRAINED with (default: "
                              "trace). Must match training, or the model is fed inputs it never saw.")
+    parser.add_argument("--captioner", choices=list(FIELD_PREFIX), default=DEFAULT_CAPTIONER,
+                        help="Which captioner's caption set to evaluate against "
+                             "(default: internvl). Must match the captioner the "
+                             "checkpoint was trained with -- it selects both the caption "
+                             "columns read and the checkpoint/predictions filenames.")
     parser.add_argument("--caption-field", dest="caption_field_override", default=None,
                         help="Override the JSON caption field the arm reads. For the "
                              "task/generic/unified prompt comparison use the dedicated arms "
@@ -117,18 +125,23 @@ def main():
     module_name = BACKBONES[args.backbone]
     print(f"[mmsd_eval] backbone={args.backbone} -> {module_name}")
     print(f"[mmsd_eval] task={describe_task()}")
-    print(f"[mmsd_eval] arm={describe_arm(args.arm, args.caption_field_override)}")
+    print(f"[mmsd_eval] arm={describe_arm(args.arm, args.caption_field_override, args.captioner)}")
     mod = importlib.import_module(module_name)
     device = mod.device
 
     checkpoint_path = args.checkpoint or os.path.join(
-        "checkpoints", checkpoint_name(args.backbone, args.arm)
+        "checkpoints", checkpoint_name(args.backbone, args.arm, args.captioner)
     )
     if not os.path.exists(checkpoint_path):
         raise SystemExit(f"Checkpoint not found: {checkpoint_path}")
 
-    sources = arm_sources(args.arm, args.caption_field_override)
-    caption_field = args.caption_field_override or mod.CAPTION_FIELD
+    sources = arm_sources(args.arm, args.caption_field_override, args.captioner)
+    # The secondary backbones read a single concrete field; it must follow the captioner
+    # so an eval never scores a qwen checkpoint against internvl captions.
+    caption_field = args.caption_field_override or next(
+        (s for s in sources if s not in ("text", "null")),
+        default_caption_field(args.captioner),
+    )
 
     data = pd.read_json(args.data_path)
     splits = dict(zip(["train", "val", "test"], split_mmsd_data(data)))

@@ -109,6 +109,17 @@ Each (task, arm) pair writes its own checkpoint and predictions file (see `check
 
 from memotion_common import TASKS, task_label_field  # noqa: F401  (re-export for callers)
 
+# Caption fields are namespaced by captioner (utils/captioner_backends.py), so the
+# InternVL and Qwen2.5-VL caption sets coexist in one dataset JSON and one results
+# directory. See `resolve_captioner` below for how a run picks its set.
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from utils.captioner_backends import FIELD_PREFIX, caption_field
+
+DEFAULT_CAPTIONER = "internvl"
+
 # The constant string used as the text stream in the image_only arm. It is deliberately
 # contentful-but-uninformative rather than empty: an empty string still tokenizes to a
 # backbone-specific BOS/EOS pair, whereas this is the same for every sample, so the text
@@ -126,6 +137,15 @@ TASK_CAPTION_FIELDS = {
     "humour": "ivl_caption_humour",
     "offensive": "ivl_caption_offensive",
     "sarcasm": "ivl_caption_sarcasm",
+}
+
+# Caption field -> its role suffix, so an arm written in InternVL's namespace can be
+# re-pointed at another captioner's caption set (`caption_field(captioner, suffix)`).
+# The per-task caption fields need no entry: their suffix IS the task name, which is how
+# TASKCAP resolves above.
+CAPTION_SUFFIX_BY_FIELD = {
+    UNIFIED_CAPTION_FIELD: "unified",
+    GENERIC_CAPTION_FIELD: "generic",
 }
 
 # Sentinel used inside `ARMS` for "the task-specific caption field". It is resolved against
@@ -177,6 +197,17 @@ ARMS = {
 DEFAULT_ARM = "trace"
 
 
+def default_caption_field(captioner=DEFAULT_CAPTIONER):
+    """The dataset's default caption column for `captioner`.
+
+    This is the column a backbone falls back to when no --caption-field is given. It must
+    follow the captioner: otherwise a `--captioner qwen` run with no explicit field would
+    read InternVL's captions while filing its results under the qwen name, which is the exact
+    mislabelling the captioner namespacing exists to prevent.
+    """
+    return caption_field(captioner, "unified")
+
+
 def get_arm(name):
     """Return the arm spec for `name`, with a helpful error listing the valid arms."""
     if name not in ARMS:
@@ -184,13 +215,21 @@ def get_arm(name):
     return ARMS[name]
 
 
-def task_caption_field(task):
-    """Return the caption field written by `memotion_cap_gen.py --prompt <task>`."""
+def task_caption_field(task, captioner=DEFAULT_CAPTIONER):
+    """Return the caption field written by `<ds>_cap_gen.py --prompt <task> --captioner <c>`.
+
+    The task name doubles as the field's role suffix, so the captioner namespace composes
+    directly: ('humour', 'qwen') -> 'qwen_caption_humour'. The membership check is what keeps
+    a typo'd task loud -- without it an unknown task would quietly resolve to a column that
+    does not exist and train as if the caption were empty.
+    """
     if task not in TASK_CAPTION_FIELDS:
         raise ValueError(
             f"No task caption field for '{task}'. Known: {', '.join(TASK_CAPTION_FIELDS)}"
         )
-    return TASK_CAPTION_FIELDS[task]
+    if captioner == DEFAULT_CAPTIONER:
+        return TASK_CAPTION_FIELDS[task]
+    return caption_field(captioner, task)
 
 
 def owning_arm(caption_field, task):
@@ -200,13 +239,24 @@ def owning_arm(caption_field, task):
     hold that set's results. `image_taskcap` owns whichever per-task field the CURRENT task
     maps to -- under `--task humour` that is `ivl_caption_humour` -- which is why ownership is
     resolved against the task rather than from a flat table.
+
+    Ownership is a property of the caption's ROLE, not of which VLM wrote it, so a
+    `qwen_caption_*` field is owned by the same arm as its `ivl_caption_*` counterpart.
+    Resolving by suffix keeps the override guard working across captioners: otherwise
+    `--arm image_taskcap --caption-field qwen_caption_unified` would slip past the check and
+    file unified-caption numbers under the task-caption arm.
     """
-    if caption_field == GENERIC_CAPTION_FIELD:
-        return "image_genericcap"
-    if caption_field == UNIFIED_CAPTION_FIELD:
-        return "image_unifiedcap"
-    if caption_field == TASK_CAPTION_FIELDS.get(task):
-        return "image_taskcap"
+    for prefix in FIELD_PREFIX.values():
+        if not caption_field.startswith(prefix + "_"):
+            continue
+        suffix = caption_field[len(prefix) + 1:]
+        if suffix == "generic":
+            return "image_genericcap"
+        if suffix == "unified":
+            return "image_unifiedcap"
+        if suffix == task:
+            return "image_taskcap"
+        return None
     return None
 
 
@@ -240,16 +290,23 @@ def check_override(name, task, caption_field):
         )
 
 
-def arm_sources(name, task, caption_field=None):
+def arm_sources(name, task, caption_field_override=None, captioner=DEFAULT_CAPTIONER):
     """Resolve an arm's text sources for `task`, honouring a --caption-field override.
 
     The TASKCAP sentinel becomes the task's own caption field, so `image_taskcap` and `trace`
     mean "the caption written for the task being classified" without the caller having to
     thread field names around.
 
-    `caption_field` substitutes for the caption slot while leaving "text"/"null" alone, so an
-    arm can be pointed at a caption set that has no arm of its own, and the override composes
-    with every arm instead of being mutually exclusive with it.
+    `caption_field_override` substitutes for the caption slot while leaving "text"/"null"
+    alone, so an arm can be pointed at a caption set that has no arm of its own, and the
+    override composes with every arm instead of being mutually exclusive with it.
+
+    `captioner` selects WHOSE captions fill the arm's caption slots -- the captioner ablation
+    reruns the same arms against a second VLM's caption set. It is applied when the slot is
+    resolved, so the arm definitions stay the single source of truth for which ROLE each
+    caption plays (task / generic / unified) and the captioner decides only whose captions
+    fill that role. An explicit --caption-field still wins over the captioner namespace, and
+    "text"/"null" slots are captioner-independent by construction.
 
     The three caption sets that DO have their own arms (task / generic / unified) must be
     reached through those arms -- see `check_override`, which callers run first.
@@ -260,7 +317,7 @@ def arm_sources(name, task, caption_field=None):
     so the override is rejected rather than guessed at.
     """
     spec_sources = get_arm(name)["sources"]
-    if caption_field is not None:
+    if caption_field_override is not None:
         caption_slots = [src for src in spec_sources if src not in ("text", "null")]
         if len(caption_slots) > 1:
             rendered = ", ".join(
@@ -276,12 +333,12 @@ def arm_sources(name, task, caption_field=None):
     for src in spec_sources:
         if src in ("text", "null"):
             resolved.append(src)
-        elif caption_field is not None:
-            resolved.append(caption_field)
+        elif caption_field_override is not None:
+            resolved.append(caption_field_override)
         elif src == TASKCAP:
-            resolved.append(task_caption_field(task))
+            resolved.append(task_caption_field(task, captioner))
         else:
-            resolved.append(src)
+            resolved.append(caption_field(captioner, CAPTION_SUFFIX_BY_FIELD[src]))
     return resolved
 
 
@@ -321,21 +378,47 @@ def loss_config_for(name):
     }
 
 
-def checkpoint_name(task, backbone, arm):
-    """Per-(task, arm) checkpoint filename, so runs never overwrite one another.
+def _smoke_tag(smoke):
+    """Filename fragment marking a throwaway smoke run (`--subset`).
+
+    A --subset run trains on a handful of rows and evaluates on a handful more, so its
+    metrics are meaningless -- but without this tag it would write to the SAME checkpoint and
+    predictions filenames as the real run of that arm and destroy hours of training. Smoke
+    runs therefore get their own `_smoke` files, which are safe to delete and impossible to
+    confuse with a real result.
+    """
+    return "_smoke" if smoke else ""
+
+
+def _captioner_tag(captioner):
+    """Filename fragment identifying the captioner, empty for the primary one.
+
+    InternVL runs keep their historical un-tagged filenames, so every checkpoint and
+    predictions file already on disk stays valid and the published numbers are not orphaned.
+    A second captioner gets its name in the filename instead, which is what stops a Qwen run
+    of an arm from overwriting the InternVL run of that same arm -- the two are different
+    experiments and must be readable side by side.
+    """
+    return "" if captioner == DEFAULT_CAPTIONER else f"{captioner}_"
+
+
+def checkpoint_name(task, backbone, arm, captioner=DEFAULT_CAPTIONER, smoke=False):
+    """Per-(task, arm, captioner) checkpoint filename, so runs never overwrite one another.
 
     Every arm, `trace` included, is suffixed with its own name. `trace` used to keep the
     un-suffixed `memotion_<task>_<backbone>_best_model.pth` for back-compat with the
     pre-ablation scripts, but it now scores all four text sources rather than two, so a run
     under the old name would no longer mean what the old checkpoints meant. Suffixing it makes
     the change visible in the filename instead of silently redefining an existing one.
+
+    The captioner tag is prepended for any non-primary captioner; see `_captioner_tag`.
     """
-    return f"memotion_{task}_{backbone}_{arm}_best_model.pth"
+    return f"memotion_{task}_{_captioner_tag(captioner)}{backbone}_{arm}{_smoke_tag(smoke)}_best_model.pth"
 
 
-def preds_name(task, backbone, arm):
-    """Per-(task, arm) test-predictions filename (same suffixing rule as `checkpoint_name`)."""
-    return f"memotion_{task}_{backbone}_{arm}_preds.json"
+def preds_name(task, backbone, arm, captioner=DEFAULT_CAPTIONER, smoke=False):
+    """Per-(task, arm, captioner) test-predictions filename (same rule as `checkpoint_name`)."""
+    return f"memotion_{task}_{_captioner_tag(captioner)}{backbone}_{arm}{_smoke_tag(smoke)}_preds.json"
 
 
 def resolve_arm(args, data, data_path):
@@ -347,8 +430,11 @@ def resolve_arm(args, data, data_path):
     that would overwrite another arm's results (see `check_override`).
     """
     check_override(args.arm, args.task, args.caption_field_override)
-    print(f"=== arm: {describe_arm(args.arm, args.task, args.caption_field_override)} ===")
-    sources = arm_sources(args.arm, args.task, args.caption_field_override)
+    # `captioner` may be absent on an older caller; default to the primary one so nothing
+    # that predates the captioner ablation changes behaviour.
+    captioner = getattr(args, "captioner", DEFAULT_CAPTIONER)
+    print(f"=== arm: {describe_arm(args.arm, args.task, args.caption_field_override, captioner)} ===")
+    sources = arm_sources(args.arm, args.task, args.caption_field_override, captioner)
 
     for src in sources:
         if src in ("text", "null"):
@@ -356,8 +442,8 @@ def resolve_arm(args, data, data_path):
         if src not in data.columns:
             raise SystemExit(
                 f"Caption field '{src}' is not in {data_path}. Generate it first, e.g.\n"
-                f"    python Memotion/memotion_cap_gen.py --prompt generic\n"
-                f"    python Memotion/memotion_cap_gen.py --merge"
+                f"    python Memotion/memotion_cap_gen.py --prompt generic --captioner {captioner}\n"
+                f"    python Memotion/memotion_cap_gen.py --merge --captioner {captioner}"
             )
         col = data[src].astype(str).str.strip()
         filled = int((~col.isin(["", "nan", "None"])).sum())
@@ -365,16 +451,23 @@ def resolve_arm(args, data, data_path):
         if filled == 0:
             raise SystemExit(
                 f"Caption field '{src}' exists but is empty in {data_path}. "
-                f"Run the matching memotion_cap_gen.py prompt and then --merge."
+                f"Run the matching memotion_cap_gen.py prompt with --captioner {captioner}, "
+                f"then --merge --captioner {captioner}."
             )
 
     return sources
 
 
-def describe_arm(name, task, caption_field=None):
-    """One-line description of an arm for log headers."""
+def describe_arm(name, task, caption_field=None, captioner=DEFAULT_CAPTIONER):
+    """One-line description of an arm for log headers.
+
+    The captioner is named explicitly: two runs of the same arm can now differ ONLY by which
+    VLM wrote the captions, so a header without it would make the two indistinguishable in a
+    log.
+    """
     spec = get_arm(name)
-    sources = arm_sources(name, task, caption_field)
+    sources = arm_sources(name, task, caption_field, captioner)
     rendered = ", ".join("<constant>" if s == "null" else s for s in sources)
     scoring = "on" if spec["relevance"] else "off"
-    return f"{name} -- {spec['label']} | text sources: [{rendered}] | caption scoring: {scoring}"
+    return (f"{name} [captioner: {captioner}] -- {spec['label']} | "
+            f"text sources: [{rendered}] | caption scoring: {scoring}")

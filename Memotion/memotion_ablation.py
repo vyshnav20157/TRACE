@@ -52,7 +52,7 @@ import subprocess
 import sys
 
 from memotion_common import TASK_ORDER
-from memotion_modality import ARMS, get_arm, preds_name
+from memotion_modality import ARMS, DEFAULT_CAPTIONER, FIELD_PREFIX, get_arm, preds_name
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TRAIN_SCRIPT = os.path.join(REPO_ROOT, "Memotion", "train_memotion.py")
@@ -82,7 +82,7 @@ ARM_ORDER = ["image_only", "image_text", "image_taskcap", "image_genericcap",
 ABLATION_TASKS = ["humour", "offensive"]
 
 
-def train_arm(task, arm, backbone, extra_args):
+def train_arm(task, arm, backbone, captioner, extra_args):
     """Train a single (task, arm) in its own subprocess. Returns True on success."""
     cmd = [sys.executable, TRAIN_SCRIPT, "--task", task, "--backbone", backbone,
            "--arm", arm] + extra_args
@@ -95,11 +95,11 @@ def train_arm(task, arm, backbone, extra_args):
     return True
 
 
-def load_results(task, backbone, arms):
+def load_results(task, backbone, arms, captioner, smoke=False):
     """Load each arm's test-prediction JSON, skipping arms that have not been run."""
     results = {}
     for arm in arms:
-        path = os.path.join(REPO_ROOT, preds_name(task, backbone, arm))
+        path = os.path.join(REPO_ROOT, preds_name(task, backbone, arm, captioner, smoke))
         if not os.path.exists(path):
             continue
         with open(path) as f:
@@ -107,7 +107,7 @@ def load_results(task, backbone, arms):
     return results
 
 
-def format_table(results, task, backbone, fmt="text"):
+def format_table(results, task, backbone, captioner, fmt="text"):
     """Render the collected per-arm metrics as an aligned text or markdown table."""
     arms = [a for a in ARM_ORDER if a in results]
     if not arms:
@@ -129,7 +129,7 @@ def format_table(results, task, backbone, fmt="text"):
             row.append(str(metrics.get(key, "-")))
         rows.append(row)
 
-    title = f"Memotion modality ablation -- task: {task}, backbone: {backbone}"
+    title = f"Memotion modality ablation -- task: {task}, backbone: {backbone} | captioner: {captioner}"
 
     if fmt == "markdown":
         out = ["| " + " | ".join(headers) + " |",
@@ -166,6 +166,11 @@ def main():
     parser.add_argument("--backbone", default="roberta", choices=["roberta"],
                         help="Backbone to run the sweep on. Roberta only -- the arms are "
                              "implemented in clip_xlm_roberta_memotion.py.")
+    parser.add_argument("--captioner", choices=list(FIELD_PREFIX), default=DEFAULT_CAPTIONER,
+                        help="Which captioner's caption sets the sweep trains on and "
+                             "collects (default: internvl). Run the sweep once per "
+                             "captioner to build the captioner-ablation comparison; "
+                             "results are filed separately so the two never collide.")
     parser.add_argument("--format", dest="fmt", default="text", choices=["text", "markdown"],
                         help="Table format (default: text).")
     parser.add_argument("--out", default=None,
@@ -174,21 +179,26 @@ def main():
     # to each training run, so the sweep can be smoke-tested or configured as a whole.
     args, extra = parser.parse_known_args()
 
+    # A --subset sweep trains smoke runs, which write `_smoke` prediction files; collect
+    # from those so the table reflects the run that just happened rather than silently
+    # showing stale real results (or nothing at all).
+    smoke = any(a == "--subset" or a.startswith("--subset=") for a in extra)
+
     tasks = ABLATION_TASKS if args.task == "all" else [args.task]
 
     if args.run:
         failed = []
         for task in tasks:
             for arm in args.arms:
-                if not train_arm(task, arm, args.backbone, extra):
+                if not train_arm(task, arm, args.backbone, args.captioner, extra):
                     failed.append(f"{task}/{arm}")
         if failed:
             print(f"\n[ablation] runs that failed: {', '.join(failed)}")
 
     tables = []
     for task in tasks:
-        results = load_results(task, args.backbone, args.arms)
-        tables.append(format_table(results, task, args.backbone, args.fmt))
+        results = load_results(task, args.backbone, args.arms, args.captioner, smoke)
+        tables.append(format_table(results, task, args.backbone, args.captioner, args.fmt))
     output = "\n".join(tables)
     print(output)
 

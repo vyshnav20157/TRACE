@@ -97,6 +97,19 @@ def main():
     # Only the roberta backbone implements the arms. Failing here beats forwarding --arm to a
     # parser that has never heard of it (argparse would abort with a confusing error) or, worse,
     # silently training the full-TRACE arm and filing the result under an ablation name.
+    # --captioner, like --arm, exists only on the roberta backbone. Forwarding it to
+    # vitl14/siglip2 would abort in their parsers with an unrecognised-argument error that
+    # says nothing about why; catching it here explains the actual constraint. It is detected
+    # in `remaining` because this parser deliberately does not declare it -- the backbone
+    # owns the flag, and re-declaring it here would mean maintaining its choices twice.
+    if args.backbone != "roberta" and any(
+        a == "--captioner" or a.startswith("--captioner=") for a in remaining
+    ):
+        raise SystemExit(
+            f"--captioner is implemented for --backbone roberta only (got "
+            f"'{args.backbone}'). The captioner ablation runs on the primary backbone."
+        )
+
     if args.arm != DEFAULT_ARM and args.backbone != "roberta":
         raise SystemExit(
             f"--arm {args.arm} is implemented for --backbone roberta only "
