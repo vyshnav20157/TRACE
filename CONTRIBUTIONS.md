@@ -19,12 +19,12 @@ detection to other multimodal meme-understanding tasks, benchmarking it against 
 SOTA on:
 
 - **MAMI (Multimedia Automatic Misogyny Identification)** — misogyny detection.
-- **Memotion 1.0 (SemEval-2020 Task 8)** — humour, sarcasm, and offensiveness detection.
+- **Memotion 1.0 (SemEval-2020 Task 8)** — humour, and offensiveness detection.
 - **MMSD2.0 (Findings of ACL 2023)** — multimodal sarcasm detection on Twitter image+text
   pairs.
 
-Memotion extends the question beyond *harm* detection: humour and sarcasm are figurative,
-non-harmful properties, so they test whether TRACE's relevance-aware captioning helps with
+Memotion extends the question beyond *harm* detection: humour is a figurative,
+non-harmful propertie, so it tests whether TRACE's relevance-aware captioning helps with
 image-text incongruity in general, or only with the harmful-content signal it was designed
 for.
 
@@ -51,7 +51,7 @@ reproducible I added:
 - **`requirements.txt`** — reconciled to the versions that actually resolve in the `trace`
   environment.
 
-### 2. Extending TRACE to the MAMI dataset (current work)
+### 2. Extending TRACE to the MAMI dataset 
 
 The core thesis contribution: a full MAMI workflow that reuses TRACE's shared machinery
 (caption selection, Gumbel-Softmax caption weighting, the classification/relevance/
@@ -112,7 +112,7 @@ preserved in the dataset JSON but not trained on.
 - **Gemini removed.** Captioning is InternVL-only, matching Memotion and MMSD. The dataset classes now read `[text, ivl_caption]` (or `[text]` alone before
   captioning).
 
-### 3. Extending TRACE to Memotion 1.0 (current work)
+### 3. Extending TRACE to Memotion 1.0
 
 A full Memotion workflow that, like the MAMI one, reuses TRACE's shared machinery
 (caption selection, Gumbel-Softmax caption weighting, the classification/relevance/
@@ -121,10 +121,10 @@ the dataset stays in place at `/home/vyshnav/MHA-MEME/dataset` and is only point
 
 Memotion differs from FHM/MAMI in three ways that drove the design:
 
-1. **Three tasks, not one.** Memotion Task B labels every meme for humour, sarcasm, *and*
+1. **Two tasks, not one.** Memotion Task B labels every meme for humour, *and*
    offensiveness. These are modeled as three independent binary problems selected with
    `--task`, never trained jointly — so each has its own checkpoint, predictions file, and
-   metrics, and they can be run one at a time (humour → offensive → sarcasm).
+   metrics.
 2. **A different official metric.** Memotion ranks on **macro-F1 at a fixed 0.5
    threshold**, whereas TRACE reports macro P/R/F1 at the F1-*optimal* threshold plus
    AUROC. Both are now reported (see below).
@@ -147,7 +147,7 @@ Memotion differs from FHM/MAMI in three ways that drove the design:
 
 #### Design decisions
 
-- **One label column, three tasks.** Rather than three dataset JSONs, the skeleton stores
+- **One label column, two tasks.** Rather than three dataset JSONs, the skeleton stores
   `humour_label`, `sarcasm_label`, and `offensive_label` together, and
   `apply_task_labels()` copies the selected one onto the generic `label` field that the
   shared `utils/` machinery expects. This means **captions are generated once and reused by
@@ -177,7 +177,7 @@ Memotion differs from FHM/MAMI in three ways that drove the design:
   produces one shared caption set covering all three dimensions; the per-task variants
   write to their own fields for a caption-specialization ablation.
 
-### 4. Extending TRACE to MMSD2.0 (current work)
+### 4. Extending TRACE to MMSD2.0 
 
 A full MMSD2.0 workflow that, like the MAMI and Memotion ones, reuses TRACE's shared
 machinery (caption selection, Gumbel-Softmax caption weighting, the classification/
@@ -261,7 +261,7 @@ Three differences drove the design:
   architecture, loss functions, caption selection, and metrics plumbing are untouched**,
   keeping the comparison to original TRACE clean.
 
-### 5. Modality-importance ablation across all three datasets (current work)
+### 5. Modality-importance ablation across all three datasets 
 
 A six-arm ablation, run identically on MAMI, Memotion, and MMSD2.0, that answers *where
 TRACE's performance actually comes from*: the image, the meme's own text, the generated
@@ -321,7 +321,7 @@ arms are attributable to the modality.
   of empty strings would otherwise silently degrade e.g. `image_genericcap` into an
   image-only run and quietly invalidate the whole table.
 
-### 6. Caption-selection instrumentation (current work)
+### 6. Caption-selection instrumentation 
 
 `trace` now ranks four highly-correlated candidates (the same image described under three
 different prompts), which raises a question the previous two-candidate setup did not: is the
@@ -348,7 +348,7 @@ The changes to `utils/` are strictly additive — `return_choices` defaults to `
 existing return signature is unchanged — so this is diagnostic instrumentation rather than a
 modification of TRACE's method, and the "reuse over rewrite" guarantee above still holds.
 
-### 7. Captioner ablation: InternVL vs. Qwen2.5-VL (current work)
+### 7. Captioner ablation: InternVL vs. Qwen2.5-VL 
 
 The modality ablation (§5) answers *which text stream* matters; this ablation asks a
 narrower question about the one stream that TRACE is built around: **how much of that
@@ -436,16 +436,121 @@ each `*_cap_gen.py`.
   `0.4.12` pin) is required there because GroundingDINO's `AutoModel` lookup enumerates every
   model config and imports the timm wrapper even though no timm model is actually used.
 
-### 8. Smoke-run filename isolation (current work)
+### 9. Statistical significance testing of the ablation grid 
 
-A `--subset N` run (used to sanity-check a change before committing to a full training run)
-was writing to the same checkpoint and predictions filenames as a real run of that arm,
-so a smoke test could silently overwrite hours of real training if run against an
-already-completed arm. `checkpoint_name()`/`preds_name()` in all three `*_modality.py` now
-take a `smoke` flag and append `_smoke` to the filename when `--subset` is set; the ablation
-drivers (`*_ablation.py`) detect `--subset` in the forwarded args and collect from the
-`_smoke` files so the results table reflects the run that just happened. Smoke files are
-never produced by a full run and are safe to delete at any time.
+The ablation tables (§5, §7) are read as claims — "the task caption beats the generic one",
+"Qwen matches InternVL" — but a table of point estimates cannot support either. With MAMI's
+1,000-row test split, a 0.6-point macro-F1 gap is well inside sampling noise; and with every
+run compared against every other, some gap will look large by chance alone. **`utils/significance.py`**
+turns every such comparison into a hypothesis test with an effect size and a
+multiple-comparison correction, so the thesis can say which differences are real.
+
+The key asset is that every run already saves its per-sample `labels` and `predictions` to
+`<run>_preds.json`, and within a dataset every run is scored on the **same rows in the same
+order**. That makes the comparisons *paired*, which is far more powerful than comparing two
+headline numbers: two arms that both sit at 0.74 macro-F1 can still differ significantly if
+they fail on different samples.
+
+#### New file
+
+| File | Purpose |
+|------|---------|
+| `utils/significance.py` | Loads every `*_preds.json` in a comparison group, runs exact McNemar and a paired bootstrap over all pairs (or against one `--baseline`), applies Holm-Bonferroni / BH-FDR correction, and appends every result to `significance_results.jsonl`. Reads only files already on disk — nothing is retrained. |
+
+#### What is tested, and why each test
+
+- **Exact McNemar on accuracy.** Accuracy decomposes per sample, so the paired disagreement
+  counts (`b01` = A right/B wrong, `b10` = A wrong/B right) are sufficient statistics. The
+  **exact** binomial test is used rather than the chi-square approximation because several
+  arms here produce few discordant pairs, where the approximation is unreliable.
+- **Paired bootstrap on macro-F1 / binary-F1.** F1 is a ratio of sums and does *not*
+  decompose per sample, so McNemar cannot test it at all. Resampling the shared rows and
+  rescoring **both** runs on the same resample preserves the pairing and gives a CI and a
+  two-sided p-value for the delta. This is what matters on Memotion (61–78% positive), where
+  accuracy is a weak metric and macro-F1 is the headline — testing accuracy alone would miss
+  the real effect.
+- **Effect sizes next to every p-value:** the discordant odds ratio `b01/b10`, Cohen's
+  g = |b01/(b01+b10) − 0.5| with its conventional small/medium/large bands, and the raw
+  accuracy/F1 deltas. A p-value says an effect is real; these say whether it is big enough to
+  matter — a distinction that a 24,635-row split like MMSD makes easy to lose, since almost
+  anything is significant there.
+- **Cohen's κ between the two runs' predictions**, which separates "two genuinely different
+  models" from "the same model with noise" — directly relevant to the captioner ablation,
+  where the question is whether swapping InternVL for Qwen changes the model's behaviour at all.
+- **Per-run bootstrap CIs** (`--per-run`), so results can be reported as
+  `macro-F1 0.7396 [0.71, 0.77]` rather than as a bare point estimate.
+
+#### Design decisions
+
+- **Comparison groups are defined by "scored on the same rows".** `GROUPS` maps each
+  dataset — and each Memotion *task* separately, since humour and offensive are different
+  label vectors over the same images — to its preds glob. `load_group()` asserts that every
+  run in a group carries an identical label vector and refuses to proceed otherwise, so an
+  accidentally-unpaired file fails loudly rather than silently invalidating every test in the
+  table.
+
+- **Multiple-comparison correction, with the family stated.** All pairs within one dataset
+  form one family — seven runs per dataset today is 21 pairs, and it grows quadratically as
+  arms and captioners are added — so raw p-values are adjusted with
+  **Holm-Bonferroni** — strong FWER control, uniformly more powerful than plain Bonferroni —
+  and **Benjamini-Hochberg FDR** is available via `--fdr` as the more appropriate correction
+  for a large exploratory grid. `--baseline <run>` compares everything against one reference
+  arm instead, shrinking the family from *n(n−1)/2* to *n−1*; this is the option to use when
+  the question is "does anything beat `trace`?", because it spends far less power on
+  comparisons the thesis does not make. The bootstrap F1 p-values are corrected as their own
+  separate family.
+
+- **Vectorized bootstrap, or the grid is not runnable.** At 10,000 resamples per pair across four
+  groups and two metrics, the naive per-resample loop runs for hours. Each row is encoded as `2*y + p`, which turns a
+  resample's confusion matrix into a `bincount`; all resamples are counted in one pass and the
+  metrics computed from the count matrix. That is ~14 s → ~0.05 s per pair. Resamples are
+  drawn in blocks of 2,000 so the index matrix stays within a few hundred MB.
+
+- **The bootstrap metric matches sklearn exactly, including its edge case.** `macro_f1_fast`
+  averages over the classes actually *present* in a resample, mirroring
+  `f1_score(average="macro", zero_division=0)`. A resample of an imbalanced split can
+  legitimately draw a single class, and averaging in a phantom 0.0 for the absent class there
+  would bias the CI downward. The vectorized and scalar implementations carry the same rule so
+  the CI and the point estimate cannot disagree.
+
+- **Append-only log with per-result provenance.** Every run appends its rows to
+  `significance_results.jsonl` by default, matching the convention of the per-dataset
+  `evalresults.jsonl`. Each row records the timestamp, git commit, exact command, seed,
+  `n_boot`, the correction family, **and a SHA1 digest of each source prediction vector** — so
+  a result traces back to the predictions that produced it, and re-testing after retraining an
+  arm is distinguishable from the stale row rather than conflated with it. `--no-log` disables;
+  `--out FILE` additionally freezes one invocation as a self-contained JSON snapshot for a
+  thesis table.
+
+- **AUROC and the tuned-threshold metrics are deliberately not tested.** The training scripts
+  compute `all_probs` but persist only the thresholded `predictions`, so the per-sample scores
+  those metrics need are not on disk. Testing them would mean re-running eval with
+  probabilities saved; everything above needs hard labels only. This is stated in the module
+  docstring rather than left as a silent gap, since "we tested accuracy and F1 but not AUROC"
+  is itself a result-reporting caveat.
+
+- **Read-only over existing artifacts.** The script trains nothing and touches no dataset
+  JSON, checkpoint, or predictions file — it only reads `*_preds.json` and writes its own log.
+  The "reuse over rewrite" guarantee is untouched: this is analysis layered on top of the
+  results, not a change to how they are produced.
+
+#### Usage
+
+```bash
+# Whole grid, FDR-adjusted, as a markdown table for the thesis
+python utils/significance.py --dataset all --fdr --format markdown
+
+# "Does anything actually beat TRACE on MMSD?" -- one baseline, F1 bootstrap included
+python utils/significance.py --dataset mmsd --baseline mmsd_roberta_trace --bootstrap
+
+# Point estimates with 95% CIs for every run
+python utils/significance.py --dataset all --per-run
+
+# Scratch run, nothing appended to the log
+python utils/significance.py --dataset mmsd --no-log
+```
+
+Groups: `mami`, `memotion_humour`, `memotion_offensive`, `mmsd`, or `all`.
 
 ---
 
